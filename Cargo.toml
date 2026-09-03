@@ -1,0 +1,16 @@
+[package]
+name = "boomux-desktop"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/gardnmi/boomux-desktop"
+description = "A fast native tiling terminal workspace for Boomux"
+
+[dependencies]
+boomux = { version = "=1.9.1", git = "https://github.com/gardnmi/boomux.git", rev = "87c03bff11ed062bb5f46dfcad793946116b1b26" }
+fastrand = "=2.5.0"
+gpui = { package = "gpui-ce", version = "=0.2.2" }
+gpui_platform = { package = "gpui_ce_platform", version = "=0.1.0", features = ["wayland", "x11"] }
+image = { version = "0.25", default-features = false }
+libghostty-vt = { version = "=0.2.1", default-features = false, features = ["kitty-graphics"] }
+smallvec = "1.15"
