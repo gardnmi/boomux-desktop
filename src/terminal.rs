@@ -149,6 +149,8 @@ struct SharedTerminal {
     revision: AtomicU64,
     application_cursor: AtomicBool,
     bracketed_paste: AtomicBool,
+    pending_scroll_row: AtomicU64,
+    pending_scroll_wakeup: AtomicBool,
     closed: AtomicBool,
 }
 
@@ -163,6 +165,8 @@ impl SharedTerminal {
             revision: AtomicU64::new(1),
             application_cursor: AtomicBool::new(false),
             bracketed_paste: AtomicBool::new(false),
+            pending_scroll_row: AtomicU64::new(0),
+            pending_scroll_wakeup: AtomicBool::new(false),
             closed: AtomicBool::new(false),
         }
     }
@@ -179,6 +183,29 @@ impl SharedTerminal {
             .ok_or_else(|| "Ghostty terminal core is not running".to_string())?
             .send(command)
             .map_err(|_| "Ghostty terminal core stopped".to_string())
+    }
+
+    fn scroll_to_row(&self, row: usize) -> Result<(), String> {
+        self.pending_scroll_row.store(row as u64, Ordering::Release);
+        if self.pending_scroll_wakeup.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+
+        let result = {
+            let emulator = self.emulator.lock().unwrap();
+            let Some(sender) = emulator.as_ref() else {
+                self.pending_scroll_wakeup.store(false, Ordering::Release);
+                return Err("Ghostty terminal core is not running".to_string());
+            };
+            sender.try_send(EmulatorCommand::ScrollLatest)
+        };
+        match result {
+            Ok(()) | Err(mpsc::TrySendError::Full(_)) => Ok(()),
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.pending_scroll_wakeup.store(false, Ordering::Release);
+                Err("Ghostty terminal core stopped".to_string())
+            }
+        }
     }
 
     fn process(&self, bytes: Vec<u8>) {
@@ -258,6 +285,7 @@ enum EmulatorCommand {
         cell_height: u32,
     },
     Scroll(ScrollViewport),
+    ScrollLatest,
     Stop,
 }
 
@@ -299,10 +327,11 @@ impl TerminalSession {
             stream,
             Arc::clone(&shared),
         );
-        shared.set_status(attachment.warning.as_deref().map_or_else(
-            || "attached".to_string(),
-            |warning| format!("attached · {warning}"),
-        ));
+        // Attachment warnings describe daemon-side environment history; they
+        // are diagnostic metadata, not actionable terminal state. Keep pane
+        // headings quiet after a successful attachment while still surfacing
+        // later connection and emulator failures through `status_message`.
+        shared.set_status("attached");
 
         Ok(Self {
             shell_id: shell.id,
@@ -323,8 +352,17 @@ impl TerminalSession {
         self.shared.closed.load(Ordering::Acquire)
     }
 
-    pub fn status(&self) -> String {
-        self.shared.status.lock().unwrap().clone()
+    pub fn status_message(&self) -> Option<String> {
+        let status = self.shared.status.lock().unwrap();
+        match status.as_str() {
+            "attached" | "connecting" => None,
+            status => Some(
+                status
+                    .strip_prefix("attached · ")
+                    .unwrap_or(status)
+                    .to_string(),
+            ),
+        }
     }
 
     pub fn screen(&self) -> TerminalScreen {
@@ -375,10 +413,7 @@ impl TerminalSession {
     }
 
     pub fn scroll_to(&self, row: usize) {
-        if let Err(error) = self
-            .shared
-            .emulator_command(EmulatorCommand::Scroll(ScrollViewport::Row(row)))
-        {
+        if let Err(error) = self.shared.scroll_to_row(row) {
             self.shared.set_status(error);
         }
     }
@@ -782,6 +817,9 @@ impl EmulatorCore {
                 self.cell_height = cell_height;
             }
             EmulatorCommand::Scroll(viewport) => self.terminal.scroll_viewport(viewport),
+            EmulatorCommand::ScrollLatest => {
+                unreachable!("latest scroll requests are resolved by the emulator worker")
+            }
             EmulatorCommand::Stop => return Ok(false),
         }
         Ok(true)
@@ -885,6 +923,21 @@ impl EmulatorCore {
             images,
             image_placements,
         })
+    }
+}
+
+fn apply_emulator_command(
+    core: &mut EmulatorCore,
+    shared: &SharedTerminal,
+    command: EmulatorCommand,
+) -> Result<bool, String> {
+    match command {
+        EmulatorCommand::ScrollLatest => {
+            shared.pending_scroll_wakeup.store(false, Ordering::Release);
+            let row = shared.pending_scroll_row.load(Ordering::Acquire) as usize;
+            core.apply(EmulatorCommand::Scroll(ScrollViewport::Row(row)))
+        }
+        command => core.apply(command),
     }
 }
 
@@ -1043,7 +1096,7 @@ fn start_emulator(
             }
 
             while let Ok(command) = receiver.recv() {
-                match core.apply(command) {
+                match apply_emulator_command(&mut core, &worker_shared, command) {
                     Ok(true) => {}
                     Ok(false) => return,
                     Err(error) => {
@@ -1054,7 +1107,7 @@ fn start_emulator(
 
                 let mut stopped = false;
                 while let Ok(command) = receiver.try_recv() {
-                    match core.apply(command) {
+                    match apply_emulator_command(&mut core, &worker_shared, command) {
                         Ok(true) => {}
                         Ok(false) => {
                             stopped = true;
@@ -1068,6 +1121,21 @@ fn start_emulator(
                 }
                 if stopped {
                     return;
+                }
+                // A full queue could not accept the wake-up marker, but it did
+                // keep the latest requested row. Apply that row once after the
+                // lossless command queue has been drained.
+                if worker_shared
+                    .pending_scroll_wakeup
+                    .swap(false, Ordering::AcqRel)
+                {
+                    let row = worker_shared.pending_scroll_row.load(Ordering::Acquire) as usize;
+                    if let Err(error) =
+                        core.apply(EmulatorCommand::Scroll(ScrollViewport::Row(row)))
+                    {
+                        worker_shared.close(error);
+                        return;
+                    }
                 }
                 if core.terminal.mode(Mode::SYNC_OUTPUT).unwrap_or(false) {
                     continue;
@@ -1373,6 +1441,7 @@ fn indexed_color(index: u8) -> u32 {
 #[cfg(test)]
 mod tests {
     use std::os::unix::net::UnixStream;
+    use std::sync::atomic::Ordering;
     use std::thread;
     use std::time::Duration;
 
@@ -1401,6 +1470,32 @@ mod tests {
         assert!(!agent_is_visible(AgentState::Inactive, false, true));
         assert!(!agent_is_visible(AgentState::Done, false, true));
         assert!(agent_is_visible(AgentState::Done, true, false));
+    }
+
+    #[test]
+    fn absolute_scroll_requests_keep_only_the_latest_row() {
+        let shared = SharedTerminal::new(terminal_profile(24, 80, 800, 480));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        shared.install_emulator(sender);
+
+        shared.scroll_to_row(10).unwrap();
+        shared.scroll_to_row(40).unwrap();
+        shared.scroll_to_row(75).unwrap();
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(EmulatorCommand::ScrollLatest)
+        ));
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(shared.pending_scroll_row.load(Ordering::Acquire), 75);
+        assert!(shared.pending_scroll_wakeup.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn rejected_scroll_request_releases_its_wakeup_slot() {
+        let shared = SharedTerminal::new(terminal_profile(24, 80, 800, 480));
+        assert!(shared.scroll_to_row(10).is_err());
+        assert!(!shared.pending_scroll_wakeup.load(Ordering::Acquire));
     }
 
     #[test]

@@ -8,12 +8,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    Animation, AnimationExt, App, Bounds, ClickEvent, ClipboardItem, Context, Corners, Div,
-    DragMoveEvent, FocusHandle, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, RenderImage, ScrollAnchor, ScrollHandle, ScrollWheelEvent,
-    SharedString, Stateful, TextRun, UnderlineStyle, Window, WindowBounds, WindowOptions, actions,
-    canvas, div, ease_out_quint, fill, font, point, prelude::*, px, relative, rgb, rgb_to_hsla,
-    rgba, size,
+    Animation, AnimationExt, App, Bounds, ClickEvent, ClipboardItem, Context, Corners, CursorStyle,
+    Div, DragMoveEvent, FocusHandle, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, RenderImage, ScrollAnchor,
+    ScrollHandle, ScrollWheelEvent, SharedString, Stateful, TextRun, UnderlineStyle, Window,
+    WindowBounds, WindowOptions, actions, canvas, div, ease_out_quint, fill, font, point,
+    prelude::*, px, relative, rgb, rgb_to_hsla, rgba, size,
 };
 use layout::{Axis, Direction, Node, Rect};
 use terminal::{
@@ -21,16 +21,16 @@ use terminal::{
     TerminalSession,
 };
 
-const HEADER_HEIGHT: f32 = 42.0;
-const FOOTER_HEIGHT: f32 = 30.0;
-const PANEL_PADDING: f32 = 8.0;
+const TAB_BAR_HEIGHT: f32 = 40.0;
 const MIN_FLOAT_WIDTH: f32 = 220.0;
 const MIN_FLOAT_HEIGHT: f32 = 160.0;
 const TERMINAL_CELL_WIDTH: f32 = 8.4;
 const TERMINAL_CELL_HEIGHT: f32 = 17.0;
 const TERMINAL_PADDING: f32 = 16.0;
 const SIDEBAR_WIDTH: f32 = 300.0;
-const LAYOUT_ANIMATION_DURATION: Duration = Duration::from_millis(180);
+const DRAWER_ANIMATION_DURATION: Duration = Duration::from_millis(180);
+const SCROLLBAR_FADE_IN_DURATION: Duration = Duration::from_millis(180);
+const SCROLLBAR_FADE_OUT_DURATION: Duration = Duration::from_millis(360);
 const DRAG_ACTIVATION_DISTANCE: f32 = 4.0;
 
 actions!(
@@ -48,10 +48,29 @@ actions!(
         ResizeRight,
         ResizeUp,
         ResizeDown,
+        ResizeSmallLeft,
+        ResizeSmallRight,
+        ResizeSmallUp,
+        ResizeSmallDown,
+        ResizeLargeLeft,
+        ResizeLargeRight,
+        ResizeLargeUp,
+        ResizeLargeDown,
+        ToggleSplit,
+        EqualizeSplit,
+        SwapSplit,
+        AlignFloatingLeft,
+        AlignFloatingRight,
+        AlignFloatingUp,
+        AlignFloatingDown,
+        CenterFloating,
+        CyclePaneNext,
+        CyclePanePrevious,
         NewPane,
         ClosePane,
         ToggleFloating,
         ToggleFullscreen,
+        ToggleSidebarDrawer,
         ToggleSidebarFocus,
         ToggleHelp,
         RenameResource,
@@ -66,6 +85,15 @@ enum NavigationRegion {
     #[default]
     Terminal,
     Sidebar,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FloatingAlignment {
+    Left,
+    Right,
+    Up,
+    Down,
+    Center,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -154,8 +182,9 @@ const KEY_TOGGLE_SIDEBAR: &str = "f6";
 const KEY_NEW_PANE: &str = "secondary-enter";
 const KEY_DETACH_PANE: &str = "secondary-w";
 const KEY_REMOVE_SHELL: &str = "secondary-shift-w";
-const KEY_TOGGLE_FLOATING: &str = "secondary-space";
+const KEY_TOGGLE_FLOATING: &str = "secondary-o";
 const KEY_TOGGLE_FULLSCREEN: &str = "secondary-f";
+const KEY_TOGGLE_SIDEBAR_DRAWER: &str = "secondary-b";
 
 const HELP_SHORTCUTS: &[ShortcutSpec] = &[
     ShortcutSpec {
@@ -179,6 +208,16 @@ const HELP_SHORTCUTS: &[ShortcutSpec] = &[
         description: "Toggle focus between sidebar and terminal",
     },
     ShortcutSpec {
+        section: ShortcutSection::Navigation,
+        keys: "Ctrl + Tab / Ctrl + Shift + Tab",
+        description: "Cycle panes forward or backward",
+    },
+    ShortcutSpec {
+        section: ShortcutSection::Navigation,
+        keys: "Ctrl + B",
+        description: "Open or close the sidebar drawer",
+    },
+    ShortcutSpec {
         section: ShortcutSection::Panes,
         keys: "Ctrl + Enter",
         description: "Create a Shell in the focused terminal's Workspace",
@@ -186,7 +225,7 @@ const HELP_SHORTCUTS: &[ShortcutSpec] = &[
     ShortcutSpec {
         section: ShortcutSection::Panes,
         keys: "Ctrl + W",
-        description: "Detach the pane; preserve its Boomux Shell",
+        description: "Minimize and detach; preserve its Boomux Shell",
     },
     ShortcutSpec {
         section: ShortcutSection::Panes,
@@ -195,13 +234,13 @@ const HELP_SHORTCUTS: &[ShortcutSpec] = &[
     },
     ShortcutSpec {
         section: ShortcutSection::Panes,
-        keys: "Ctrl + Space",
+        keys: "Ctrl + O",
         description: "Toggle tiled or floating",
     },
     ShortcutSpec {
         section: ShortcutSection::Panes,
         keys: "Ctrl + F",
-        description: "Toggle fullscreen",
+        description: "Maximize within the workspace",
     },
     ShortcutSpec {
         section: ShortcutSection::Panes,
@@ -211,7 +250,32 @@ const HELP_SHORTCUTS: &[ShortcutSpec] = &[
     ShortcutSpec {
         section: ShortcutSection::Panes,
         keys: "Ctrl + Alt + H J K L",
+        description: "Resize the focused pane precisely",
+    },
+    ShortcutSpec {
+        section: ShortcutSection::Panes,
+        keys: "Ctrl + Alt + Arrow",
         description: "Resize the focused pane",
+    },
+    ShortcutSpec {
+        section: ShortcutSection::Panes,
+        keys: "Ctrl + Alt + Shift + H J K L",
+        description: "Resize the focused pane by a large step",
+    },
+    ShortcutSpec {
+        section: ShortcutSection::Panes,
+        keys: "Ctrl + Alt + S / E / R",
+        description: "Rotate, equalize, or swap the nearest split",
+    },
+    ShortcutSpec {
+        section: ShortcutSection::Panes,
+        keys: "Ctrl + Alt + Shift + Arrow",
+        description: "Align a floating pane to a canvas edge",
+    },
+    ShortcutSpec {
+        section: ShortcutSection::Panes,
+        keys: "Ctrl + Alt + C",
+        description: "Center a floating pane",
     },
     ShortcutSpec {
         section: ShortcutSection::Panes,
@@ -261,7 +325,12 @@ const HELP_SHORTCUTS: &[ShortcutSpec] = &[
     ShortcutSpec {
         section: ShortcutSection::Sidebar,
         keys: "Enter",
-        description: "Activate the selected row",
+        description: "Open the selected Workspace or Shell",
+    },
+    ShortcutSpec {
+        section: ShortcutSection::Sidebar,
+        keys: "Space",
+        description: "Collapse or expand the selected Workspace",
     },
     ShortcutSpec {
         section: ShortcutSection::Sidebar,
@@ -272,6 +341,16 @@ const HELP_SHORTCUTS: &[ShortcutSpec] = &[
         section: ShortcutSection::Sidebar,
         keys: "Ctrl + Enter",
         description: "Create a Shell in the selected row's Workspace",
+    },
+    ShortcutSpec {
+        section: ShortcutSection::Sidebar,
+        keys: "Ctrl + Shift + Up / Down",
+        description: "Move the selected Workspace",
+    },
+    ShortcutSpec {
+        section: ShortcutSection::Sidebar,
+        keys: "Left drag",
+        description: "Reorder a Workspace row",
     },
     ShortcutSpec {
         section: ShortcutSection::Sidebar,
@@ -308,6 +387,108 @@ fn visible_sidebar_items(
         shell_id: agent.shell_id.clone(),
     }));
     items
+}
+
+fn reconcile_workspace_order(order: &mut Vec<String>, overview: &mut BoomuxOverview) {
+    let known = overview
+        .workspaces
+        .iter()
+        .map(|workspace| workspace.id.clone())
+        .collect::<HashSet<_>>();
+    order.retain(|workspace_id| known.contains(workspace_id));
+    for workspace in &overview.workspaces {
+        if !order.contains(&workspace.id) {
+            order.push(workspace.id.clone());
+        }
+    }
+    overview.workspaces.sort_by_key(|workspace| {
+        order
+            .iter()
+            .position(|workspace_id| workspace_id == &workspace.id)
+            .unwrap_or(usize::MAX)
+    });
+}
+
+fn reorder_workspace(order: &mut Vec<String>, source: &str, target: &str, after: bool) -> bool {
+    if source == target {
+        return false;
+    }
+    let Some(source_index) = order.iter().position(|id| id == source) else {
+        return false;
+    };
+    let previous = order.clone();
+    let source_id = order.remove(source_index);
+    let Some(target_index) = order.iter().position(|id| id == target) else {
+        *order = previous;
+        return false;
+    };
+    order.insert(target_index + usize::from(after), source_id);
+    *order != previous
+}
+
+const SIDEBAR_WORKSPACE_HEADER_HEIGHT: f32 = 52.0;
+const SIDEBAR_SHELL_ROW_HEIGHT: f32 = 39.0;
+
+fn sidebar_workspace_height(
+    workspace: &terminal::WorkspaceChoice,
+    expanded_workspaces: &HashSet<String>,
+    pane_layout_mode: PaneLayoutMode,
+) -> f32 {
+    let shell_height = if pane_layout_mode != PaneLayoutMode::Tabbed
+        && expanded_workspaces.contains(&workspace.id)
+    {
+        workspace.shells.len() as f32 * SIDEBAR_SHELL_ROW_HEIGHT
+    } else {
+        0.0
+    };
+    SIDEBAR_WORKSPACE_HEADER_HEIGHT + shell_height
+}
+
+fn sidebar_workspace_offsets(
+    overview: &BoomuxOverview,
+    expanded_workspaces: &HashSet<String>,
+    pane_layout_mode: PaneLayoutMode,
+) -> HashMap<String, f32> {
+    let mut y = 0.0;
+    overview
+        .workspaces
+        .iter()
+        .map(|workspace| {
+            let offset = (workspace.id.clone(), y);
+            y += sidebar_workspace_height(workspace, expanded_workspaces, pane_layout_mode);
+            offset
+        })
+        .collect()
+}
+
+fn sidebar_workspace_drop_target(
+    overview: &BoomuxOverview,
+    expanded_workspaces: &HashSet<String>,
+    pane_layout_mode: PaneLayoutMode,
+    pointer_y: f32,
+) -> Option<(String, bool)> {
+    let first = overview.workspaces.first()?;
+    if pointer_y <= 0.0 {
+        return Some((first.id.clone(), false));
+    }
+
+    let mut y = 0.0;
+    for workspace in &overview.workspaces {
+        let height = sidebar_workspace_height(workspace, expanded_workspaces, pane_layout_mode);
+        if pointer_y < y + height {
+            return Some((workspace.id.clone(), pointer_y >= y + height / 2.0));
+        }
+        y += height;
+    }
+
+    overview
+        .workspaces
+        .last()
+        .map(|workspace| (workspace.id.clone(), true))
+}
+
+fn sidebar_item_visible_in_layout(mode: PaneLayoutMode, item: &SidebarItem) -> bool {
+    mode != PaneLayoutMode::Tabbed || !matches!(item, SidebarItem::Shell { .. })
 }
 
 fn reconciled_sidebar_item(
@@ -365,10 +546,137 @@ struct FloatingPane {
     height: f32,
 }
 
+#[derive(Clone, Debug)]
+struct FloatingAnimation {
+    pane_id: usize,
+    from: FloatingPane,
+    generation: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PaneMinimizeAnimation {
+    pane_id: usize,
+    from: FloatingPane,
+    generation: u64,
+    duration: Duration,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum PointerOperation {
     Move,
     Resize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PaneCornerStyle {
+    #[default]
+    Rounded,
+    Square,
+    Mixed,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum WorkspacePaneMode {
+    #[default]
+    Workspace,
+    Mixed,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PaneLayoutMode {
+    #[default]
+    Tiled,
+    Tabbed,
+}
+
+fn pane_layout_supports_scope(layout: PaneLayoutMode, scope: WorkspacePaneMode) -> bool {
+    layout != PaneLayoutMode::Tabbed || scope == WorkspacePaneMode::Workspace
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShellPanePresence {
+    Focused,
+    Open,
+    Minimized,
+}
+
+impl ShellPanePresence {
+    fn glyph(self) -> &'static str {
+        match self {
+            Self::Focused => "●",
+            Self::Open => "◉",
+            Self::Minimized => "○",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Focused | Self::Open => "open",
+            Self::Minimized => "minimized",
+        }
+    }
+}
+
+fn shell_pane_presence(focused: bool, open: bool) -> ShellPanePresence {
+    if focused {
+        ShellPanePresence::Focused
+    } else if open {
+        ShellPanePresence::Open
+    } else {
+        ShellPanePresence::Minimized
+    }
+}
+
+fn workspace_open_replaces_panes(
+    mode: WorkspacePaneMode,
+    current: &HashSet<String>,
+    desired: &HashSet<String>,
+) -> bool {
+    mode == WorkspacePaneMode::Workspace && current != desired
+}
+
+fn shell_open_replaces_panes(
+    mode: WorkspacePaneMode,
+    open_workspace_ids: &HashSet<String>,
+    target_workspace_id: &str,
+) -> bool {
+    mode == WorkspacePaneMode::Workspace
+        && open_workspace_ids
+            .iter()
+            .any(|workspace_id| workspace_id != target_workspace_id)
+}
+
+fn shell_is_minimized(minimized_shells: &HashSet<String>, shell_id: &str) -> bool {
+    minimized_shells.contains(shell_id)
+}
+
+fn reveal_opened_workspace(
+    mode: WorkspacePaneMode,
+    expanded_workspaces: &mut HashSet<String>,
+    workspace_id: &str,
+) {
+    if mode == WorkspacePaneMode::Workspace {
+        expanded_workspaces.clear();
+    }
+    expanded_workspaces.insert(workspace_id.to_string());
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum MotionSpeed {
+    Instant,
+    Fast,
+    #[default]
+    Smooth,
+}
+
+impl MotionSpeed {
+    fn duration(self) -> Option<Duration> {
+        match self {
+            Self::Instant => None,
+            Self::Fast => Some(Duration::from_millis(180)),
+            Self::Smooth => Some(Duration::from_millis(360)),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -385,6 +693,13 @@ struct PointerDrag {
 struct LayoutAnimation {
     from: HashMap<usize, Rect>,
     generation: u64,
+    paint_last: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct WorkspaceOrderAnimation {
+    from: HashMap<String, f32>,
+    generation: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -394,19 +709,50 @@ enum PointerSubject {
     Tiled(Node),
 }
 
-#[derive(Clone)]
-struct TerminalScrollbarDrag(usize);
-
-impl Render for TerminalScrollbarDrag {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        gpui::Empty
-    }
+#[derive(Clone, Debug)]
+struct TerminalScrollbarPointerDrag {
+    pane_id: usize,
+    start_pointer_y: f32,
+    start_offset: usize,
+    maximum_offset: usize,
+    travel_height: f32,
 }
 
 #[derive(Clone)]
 struct TerminalSelectionDrag {
     pane_id: usize,
     started: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+struct WorkspaceRowDrag {
+    workspace_id: String,
+    workspace_name: String,
+}
+
+impl Render for WorkspaceRowDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(px(270.0))
+            .h(px(48.0))
+            .px_3()
+            .flex()
+            .items_center()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0xcba6f7))
+            .bg(rgb(0x252536))
+            .shadow_lg()
+            .child(div().size_2().rounded_full().bg(rgb(0x89b4fa)))
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(0xcdd6f4))
+                    .child(self.workspace_name.clone()),
+            )
+    }
 }
 
 impl Render for TerminalSelectionDrag {
@@ -444,6 +790,170 @@ fn dragged_bounds(
     bounds
 }
 
+fn clamp_floating_to_panel(mut bounds: FloatingPane, panel_size: (f32, f32)) -> FloatingPane {
+    bounds.width = bounds.width.min(panel_size.0);
+    bounds.height = bounds.height.min(panel_size.1);
+    bounds.x = bounds.x.clamp(0.0, (panel_size.0 - bounds.width).max(0.0));
+    bounds.y = bounds.y.clamp(0.0, (panel_size.1 - bounds.height).max(0.0));
+    bounds
+}
+
+fn align_floating_to_panel(
+    bounds: FloatingPane,
+    alignment: FloatingAlignment,
+    panel_size: (f32, f32),
+    pane_gap: f32,
+) -> FloatingPane {
+    let mut bounds = clamp_floating_to_panel(bounds, panel_size);
+    let max_x = (panel_size.0 - bounds.width).max(0.0);
+    let max_y = (panel_size.1 - bounds.height).max(0.0);
+    let left = pane_gap.min(max_x);
+    let right = (max_x - pane_gap).max(0.0);
+    let top = pane_gap.min(max_y);
+    let bottom = (max_y - pane_gap).max(0.0);
+    match alignment {
+        FloatingAlignment::Left => bounds.x = left,
+        FloatingAlignment::Right => bounds.x = right,
+        FloatingAlignment::Up => bounds.y = top,
+        FloatingAlignment::Down => bounds.y = bottom,
+        FloatingAlignment::Center => {
+            bounds.x = max_x / 2.0;
+            bounds.y = max_y / 2.0;
+        }
+    }
+    bounds
+}
+
+fn resize_floating_in_direction(
+    bounds: FloatingPane,
+    direction: Direction,
+    amount: f32,
+    panel_size: (f32, f32),
+) -> FloatingPane {
+    let mut bounds = clamp_floating_to_panel(bounds, panel_size);
+    match direction {
+        Direction::Left => bounds.width = (bounds.width - amount).max(MIN_FLOAT_WIDTH),
+        Direction::Right => {
+            let delta = amount.min((panel_size.0 - bounds.x - bounds.width).max(0.0));
+            bounds.width += delta;
+        }
+        Direction::Up => bounds.height = (bounds.height - amount).max(MIN_FLOAT_HEIGHT),
+        Direction::Down => {
+            let delta = amount.min((panel_size.1 - bounds.y - bounds.height).max(0.0));
+            bounds.height += delta;
+        }
+    }
+    bounds
+}
+
+fn cycled_pane_id(ids: &[usize], focused: usize, backwards: bool) -> Option<usize> {
+    if ids.is_empty() {
+        return None;
+    }
+    let current = ids.iter().position(|id| *id == focused).unwrap_or(0);
+    let next = if backwards {
+        current.checked_sub(1).unwrap_or(ids.len() - 1)
+    } else {
+        (current + 1) % ids.len()
+    };
+    Some(ids[next])
+}
+
+fn ordered_pane_ids(layout: Option<&Node>, floating: &[FloatingPane]) -> Vec<usize> {
+    let mut ids = layout.map_or_else(Vec::new, Node::pane_ids);
+    let mut floating_ids = floating.iter().map(|pane| pane.id).collect::<Vec<_>>();
+    floating_ids.sort_unstable();
+    ids.extend(floating_ids);
+    ids
+}
+
+fn centered_floating_pane(id: usize, panel_size: (f32, f32), pane_gap: f32) -> FloatingPane {
+    let margin = pane_gap.max(24.0);
+    let available_width = (panel_size.0 - margin * 2.0).max(1.0);
+    let available_height = (panel_size.1 - margin * 2.0).max(1.0);
+    let width = (panel_size.0 * 0.7)
+        .clamp(MIN_FLOAT_WIDTH, 1_100.0)
+        .min(available_width);
+    let height = (panel_size.1 * 0.72)
+        .clamp(MIN_FLOAT_HEIGHT, 760.0)
+        .min(available_height);
+    FloatingPane {
+        id,
+        x: (panel_size.0 - width) / 2.0,
+        y: (panel_size.1 - height) / 2.0,
+        width,
+        height,
+    }
+}
+
+fn workspace_maximized_pane(id: usize, panel_size: (f32, f32), pane_gap: f32) -> FloatingPane {
+    let (inner_width, inner_height) = inset_panel_size(panel_size, pane_gap);
+    FloatingPane {
+        id,
+        x: pane_gap,
+        y: pane_gap,
+        width: (inner_width - pane_gap).max(1.0),
+        height: (inner_height - pane_gap).max(1.0),
+    }
+}
+
+fn interpolate_floating_pane(
+    from: &FloatingPane,
+    to: &FloatingPane,
+    progress: f32,
+) -> FloatingPane {
+    let lerp = |start: f32, end: f32| start + (end - start) * progress;
+    FloatingPane {
+        id: to.id,
+        x: lerp(from.x, to.x),
+        y: lerp(from.y, to.y),
+        width: lerp(from.width, to.width),
+        height: lerp(from.height, to.height),
+    }
+}
+
+fn inset_panel_size(panel_size: (f32, f32), inset: f32) -> (f32, f32) {
+    (
+        (panel_size.0 - inset * 2.0).max(1.0),
+        (panel_size.1 - inset * 2.0).max(1.0),
+    )
+}
+
+fn pane_corner_radii(pane_id: usize, style: PaneCornerStyle) -> [f32; 4] {
+    match style {
+        PaneCornerStyle::Rounded => [8.0; 4],
+        PaneCornerStyle::Square => [0.0; 4],
+        PaneCornerStyle::Mixed => {
+            const RADII: &[f32] = &[0.0, 3.0, 7.0, 12.0, 18.0];
+            let mut seed = (pane_id as u64)
+                .wrapping_add(0x9e37_79b9_7f4a_7c15)
+                .wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            let mut corners = std::array::from_fn(|_| {
+                seed ^= seed >> 30;
+                seed = seed.wrapping_mul(0x94d0_49bb_1331_11eb);
+                seed ^= seed >> 27;
+                RADII[seed as usize % RADII.len()]
+            });
+            let square_corner = seed as usize % corners.len();
+            corners[square_corner] = 0.0;
+            if corners.iter().all(|radius| *radius == 0.0) {
+                corners[(square_corner + 1) % corners.len()] = 12.0;
+            }
+            corners
+        }
+    }
+}
+
+fn blend_rgb(from: u32, to: u32, strength: u8) -> u32 {
+    let amount = u32::from(strength.min(100));
+    let channel = |shift: u32| {
+        let start = (from >> shift) & 0xff_u32;
+        let end = (to >> shift) & 0xff_u32;
+        (start * (100 - amount) + end * amount + 50) / 100
+    };
+    (channel(16) << 16) | (channel(8) << 8) | channel(0)
+}
+
 fn resized_tiled_layout(
     mut layout: Node,
     pane_id: usize,
@@ -465,6 +975,30 @@ fn interpolate_rect(from: Rect, to: Rect, progress: f32) -> Rect {
     }
 }
 
+fn workspace_layout_rects(layout: &Node, maximized: Option<usize>) -> Vec<(usize, Rect)> {
+    let mut rects = layout.rects();
+    let Some(maximized) = maximized.filter(|id| layout.contains(*id)) else {
+        return rects;
+    };
+    if let Some((_, rect)) = rects.iter_mut().find(|(id, _)| *id == maximized) {
+        *rect = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
+    }
+    // The maximized pane must paint after its tiled siblings.
+    rects.sort_by_key(|(id, _)| *id == maximized);
+    rects
+}
+
+fn paint_layout_pane_last(rects: &mut [(usize, Rect)], pane_id: Option<usize>) {
+    if let Some(pane_id) = pane_id {
+        rects.sort_by_key(|(id, _)| *id == pane_id);
+    }
+}
+
 fn swap_layout_direction(
     layout: &mut Node,
     focused: usize,
@@ -476,8 +1010,12 @@ fn swap_layout_direction(
     Some(previous_rects)
 }
 
-fn window_point_to_panel(x: f32, y: f32) -> (f32, f32) {
-    (x - SIDEBAR_WIDTH, y - HEADER_HEIGHT)
+fn window_point_to_panel(x: f32, y: f32, sidebar_width: f32) -> (f32, f32) {
+    (x - sidebar_width, y)
+}
+
+fn pointer_moved_from(anchor: (f32, f32), current: (f32, f32)) -> bool {
+    (anchor.0 - current.0).abs() > 0.5 || (anchor.1 - current.1).abs() > 0.5
 }
 
 fn terminal_cell_from_offset(x: f32, y: f32, screen: &TerminalScreen) -> (usize, usize) {
@@ -547,6 +1085,24 @@ fn scrollbar_thumb_fraction(screen: &TerminalScreen, track_height: f32) -> f32 {
     visible.max(minimum).min(1.0)
 }
 
+fn scrollbar_offset_from_drag(
+    start_offset: usize,
+    maximum_offset: usize,
+    pointer_delta: f32,
+    travel_height: f32,
+) -> usize {
+    if maximum_offset == 0 || travel_height <= 0.0 {
+        return 0;
+    }
+    (start_offset as f32 + pointer_delta / travel_height * maximum_offset as f32)
+        .round()
+        .clamp(0.0, maximum_offset as f32) as usize
+}
+
+fn scrollbar_fade_opacity(visible: bool, progress: f32) -> f32 {
+    if visible { progress } else { 1.0 - progress }
+}
+
 fn desktop_window_title(workspace_name: Option<&str>) -> String {
     workspace_name.map_or_else(
         || "Boomux Desktop".into(),
@@ -558,20 +1114,41 @@ struct Workspace {
     layout: Option<Node>,
     floating: Vec<FloatingPane>,
     pointer_drag: Option<PointerDrag>,
+    terminal_scrollbar_drag: Option<TerminalScrollbarPointerDrag>,
     layout_animation: Option<LayoutAnimation>,
+    workspace_order_animation: Option<WorkspaceOrderAnimation>,
+    floating_animation: Option<FloatingAnimation>,
+    minimizing_panes: Vec<PaneMinimizeAnimation>,
     animation_generation: u64,
     focused: usize,
     fullscreen: Option<usize>,
     boomux_shells: Vec<ShellChoice>,
     boomux_overview: BoomuxOverview,
+    workspace_order: Vec<String>,
     boomux_error: Option<String>,
     expanded_workspaces: HashSet<String>,
     navigation_region: NavigationRegion,
+    sidebar_focus_pointer: Option<(f32, f32)>,
     sidebar_item: Option<SidebarItem>,
     sidebar_scroll_handle: ScrollHandle,
     sidebar_scroll_anchor: ScrollAnchor,
+    minimized_tab_scroll_handle: ScrollHandle,
     sidebar_menu: Option<SidebarMenu>,
+    sidebar_header_menu_open: bool,
     resource_dialog: Option<ResourceDialog>,
+    sidebar_visible: bool,
+    drawer_animation_from: Option<f32>,
+    drawer_animation_generation: u64,
+    pane_headings_visible: bool,
+    pane_corner_style: PaneCornerStyle,
+    pane_gap: f32,
+    focus_highlight_strength: u8,
+    motion_speed: MotionSpeed,
+    workspace_pane_mode: WorkspacePaneMode,
+    pane_layout_mode: PaneLayoutMode,
+    minimized_shells: HashSet<String>,
+    confirm_destructive_actions: bool,
+    settings_open: bool,
     help_open: bool,
     help_scroll_handle: ScrollHandle,
     terminals: HashMap<usize, TerminalPane>,
@@ -587,6 +1164,8 @@ struct TerminalPane {
     attaching: bool,
     error: Option<String>,
     scroll_remainder: f32,
+    scrollbar_hovered: bool,
+    scrollbar_fade_generation: u64,
     selection: Option<TerminalSelection>,
     render_images: HashMap<u64, Arc<RenderImage>>,
 }
@@ -604,6 +1183,11 @@ impl Workspace {
             .iter()
             .flat_map(|workspace| workspace.shells.iter().cloned())
             .collect::<Vec<_>>();
+        let workspace_order = boomux_overview
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id.clone())
+            .collect();
 
         let layout = Node::pane(1);
         let mut terminals = HashMap::new();
@@ -636,25 +1220,47 @@ impl Workspace {
             .unwrap_or_default();
         let sidebar_scroll_handle = ScrollHandle::new();
         let sidebar_scroll_anchor = ScrollAnchor::for_handle(sidebar_scroll_handle.clone());
+        let minimized_tab_scroll_handle = ScrollHandle::new();
         let help_scroll_handle = ScrollHandle::new();
         let mut workspace = Self {
             layout: Some(layout),
             floating: Vec::new(),
             pointer_drag: None,
+            terminal_scrollbar_drag: None,
             layout_animation: None,
+            workspace_order_animation: None,
+            floating_animation: None,
+            minimizing_panes: Vec::new(),
             animation_generation: 0,
             focused: 1,
             fullscreen: None,
             boomux_shells,
             boomux_overview,
+            workspace_order,
             boomux_error,
             expanded_workspaces,
             navigation_region: NavigationRegion::Terminal,
+            sidebar_focus_pointer: None,
             sidebar_item: None,
             sidebar_scroll_handle,
             sidebar_scroll_anchor,
+            minimized_tab_scroll_handle,
             sidebar_menu: None,
+            sidebar_header_menu_open: false,
             resource_dialog: None,
+            sidebar_visible: true,
+            drawer_animation_from: None,
+            drawer_animation_generation: 0,
+            pane_headings_visible: true,
+            pane_corner_style: PaneCornerStyle::Rounded,
+            pane_gap: 8.0,
+            focus_highlight_strength: 100,
+            motion_speed: MotionSpeed::Smooth,
+            workspace_pane_mode: WorkspacePaneMode::Workspace,
+            pane_layout_mode: PaneLayoutMode::Tiled,
+            minimized_shells: HashSet::new(),
+            confirm_destructive_actions: true,
+            settings_open: false,
             help_open: false,
             help_scroll_handle,
             terminals,
@@ -662,8 +1268,9 @@ impl Workspace {
             focus_handle,
         };
         if let Some(shell) = initial_shell {
-            let size = workspace.terminal_grid_size(1, window);
-            workspace.start_terminal_attachment(1, shell, size, cx);
+            let workspace_id = shell.workspace_id.clone();
+            let shell_id = shell.id.clone();
+            workspace.open_workspace(&workspace_id, Some(&shell_id), window, cx);
         }
         workspace.watch_boomux_overview(cx);
         workspace
@@ -694,6 +1301,45 @@ impl Workspace {
         }
     }
 
+    fn raise_floating_pane(&mut self, pane_id: usize) {
+        if let Some(index) = self.floating.iter().position(|pane| pane.id == pane_id)
+            && index + 1 != self.floating.len()
+        {
+            let pane = self.floating.remove(index);
+            self.floating.push(pane);
+        }
+    }
+
+    fn cycle_pane(&mut self, backwards: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.navigation_region == NavigationRegion::Sidebar {
+            self.leave_sidebar(cx);
+        }
+        let pane_ids = ordered_pane_ids(self.layout.as_ref(), &self.floating);
+        let Some(next) = cycled_pane_id(&pane_ids, self.focused, backwards) else {
+            return;
+        };
+        self.focus_terminal_pane(next, window, cx);
+    }
+
+    fn focus_terminal_pane(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.terminals.contains_key(&pane_id) {
+            return;
+        }
+        self.focused = pane_id;
+        self.raise_floating_pane(pane_id);
+        self.navigation_region = NavigationRegion::Terminal;
+        self.sidebar_focus_pointer = None;
+        window.focus(&self.focus_handle, cx);
+        if let Some(terminal) = self
+            .terminals
+            .get(&pane_id)
+            .and_then(|pane| pane.session.as_ref())
+        {
+            terminal.focus();
+        }
+        cx.notify();
+    }
+
     fn preferred_sidebar_item(&self, visible: &[SidebarItem]) -> Option<SidebarItem> {
         let pane = self.terminals.get(&self.focused);
         let shell_id = pane
@@ -718,11 +1364,108 @@ impl Workspace {
         })
     }
 
+    fn sidebar_navigation_items(&self) -> Vec<SidebarItem> {
+        visible_sidebar_items(&self.boomux_overview, &self.expanded_workspaces)
+            .into_iter()
+            .filter(|item| sidebar_item_visible_in_layout(self.pane_layout_mode, item))
+            .collect()
+    }
+
     fn reconcile_sidebar_item(&mut self) {
-        let visible = visible_sidebar_items(&self.boomux_overview, &self.expanded_workspaces);
+        let visible = self.sidebar_navigation_items();
         let preferred = self.preferred_sidebar_item(&visible);
         self.sidebar_item =
             reconciled_sidebar_item(self.sidebar_item.as_ref(), preferred.as_ref(), &visible);
+    }
+
+    fn set_boomux_overview(&mut self, mut overview: BoomuxOverview) {
+        reconcile_workspace_order(&mut self.workspace_order, &mut overview);
+        self.boomux_shells = overview
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.shells.iter().cloned())
+            .collect();
+        self.retain_known_minimized_shells(&overview);
+        self.boomux_overview = overview;
+    }
+
+    fn reorder_workspace_relative(
+        &mut self,
+        source: &str,
+        target: &str,
+        after: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let from = sidebar_workspace_offsets(
+            &self.boomux_overview,
+            &self.expanded_workspaces,
+            self.pane_layout_mode,
+        );
+        if reorder_workspace(&mut self.workspace_order, source, target, after) {
+            reconcile_workspace_order(&mut self.workspace_order, &mut self.boomux_overview);
+            if let Some(duration) = self.motion_speed.duration() {
+                self.animation_generation = self.animation_generation.wrapping_add(1);
+                let generation = self.animation_generation;
+                self.workspace_order_animation = Some(WorkspaceOrderAnimation { from, generation });
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(duration).await;
+                    this.update(cx, |this, cx| {
+                        if this
+                            .workspace_order_animation
+                            .as_ref()
+                            .is_some_and(|animation| animation.generation == generation)
+                        {
+                            this.workspace_order_animation = None;
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+            } else {
+                self.workspace_order_animation = None;
+            }
+            cx.notify();
+        }
+    }
+
+    fn drag_workspace(
+        &mut self,
+        event: &DragMoveEvent<WorkspaceRowDrag>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let source = event.drag(cx).workspace_id.clone();
+        let pointer_y = f32::from(event.event.position.y - event.bounds.top());
+        if let Some((target, after)) = sidebar_workspace_drop_target(
+            &self.boomux_overview,
+            &self.expanded_workspaces,
+            self.pane_layout_mode,
+            pointer_y,
+        ) {
+            self.reorder_workspace_relative(&source, &target, after, cx);
+        }
+        cx.stop_propagation();
+    }
+
+    fn move_selected_workspace(&mut self, offset: isize, cx: &mut Context<Self>) -> bool {
+        let Some(SidebarItem::Workspace(workspace_id)) = self.sidebar_item.clone() else {
+            return false;
+        };
+        let Some(index) = self
+            .workspace_order
+            .iter()
+            .position(|id| id == &workspace_id)
+        else {
+            return false;
+        };
+        let target = index.saturating_add_signed(offset);
+        if target >= self.workspace_order.len() || target == index {
+            return true;
+        }
+        let target_id = self.workspace_order[target].clone();
+        self.reorder_workspace_relative(&workspace_id, &target_id, offset.is_positive(), cx);
+        true
     }
 
     fn reveal_sidebar_item(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -730,7 +1473,18 @@ impl Workspace {
     }
 
     fn enter_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.sidebar_visible {
+            self.drawer_animation_from = Some(0.0);
+            self.drawer_animation_generation = self.drawer_animation_generation.wrapping_add(1);
+            self.sidebar_visible = true;
+            let panel_size = self.panel_size(window);
+            for pane in &mut self.floating {
+                *pane = clamp_floating_to_panel(pane.clone(), panel_size);
+            }
+        }
         self.navigation_region = NavigationRegion::Sidebar;
+        let pointer = window.mouse_position();
+        self.sidebar_focus_pointer = Some((f32::from(pointer.x), f32::from(pointer.y)));
         self.reconcile_sidebar_item();
         window.focus(&self.focus_handle, cx);
         self.reveal_sidebar_item(window, cx);
@@ -739,6 +1493,7 @@ impl Workspace {
 
     fn leave_sidebar(&mut self, cx: &mut Context<Self>) {
         self.navigation_region = NavigationRegion::Terminal;
+        self.sidebar_focus_pointer = None;
         if let Some(terminal) = self
             .terminals
             .get(&self.focused)
@@ -762,12 +1517,72 @@ impl Workspace {
         }
     }
 
+    fn toggle_sidebar_drawer(
+        &mut self,
+        _: &ToggleSidebarDrawer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous_width = self.sidebar_width();
+        self.sidebar_visible = !self.sidebar_visible;
+        self.drawer_animation_generation = self.drawer_animation_generation.wrapping_add(1);
+        self.drawer_animation_from = Some(previous_width);
+        self.sidebar_menu = None;
+        self.sidebar_header_menu_open = false;
+        let panel_size = self.panel_size(window);
+        for pane in &mut self.floating {
+            *pane = clamp_floating_to_panel(pane.clone(), panel_size);
+        }
+        if !self.sidebar_visible && self.navigation_region == NavigationRegion::Sidebar {
+            self.leave_sidebar(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn toggle_settings(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_header_menu_open = false;
+        self.settings_open = !self.settings_open;
+        if self.settings_open {
+            self.help_open = false;
+            self.sidebar_menu = None;
+        }
+        cx.notify();
+    }
+
+    fn set_pane_layout_mode(
+        &mut self,
+        mode: PaneLayoutMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pane_layout_mode == mode {
+            return;
+        }
+        self.pane_layout_mode = mode;
+        if mode == PaneLayoutMode::Tabbed {
+            self.workspace_pane_mode = WorkspacePaneMode::Workspace;
+            let workspace_id = self
+                .terminals
+                .get(&self.focused)
+                .and_then(|pane| pane.shell.as_ref())
+                .map(|shell| shell.workspace_id.clone());
+            if let Some(workspace_id) = workspace_id {
+                self.open_workspace(&workspace_id, None, window, cx);
+            }
+        }
+        self.reconcile_sidebar_item();
+        cx.notify();
+    }
+
     fn toggle_help(&mut self, _: &ToggleHelp, _: &mut Window, cx: &mut Context<Self>) {
         if !self.help_open && self.resource_dialog.is_some() {
             return;
         }
+        self.sidebar_header_menu_open = false;
         self.help_open = !self.help_open;
         if self.help_open {
+            self.settings_open = false;
             self.sidebar_menu = None;
             self.help_scroll_handle.set_offset(point(px(0.0), px(0.0)));
         }
@@ -849,11 +1664,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let menu_height = if matches!(target, SidebarResource::Workspace { .. }) {
-            112.0
+            146.0
         } else {
             78.0
         };
         let maximum = (f32::from(window.viewport_size().height) - menu_height - 8.0).max(8.0);
+        self.sidebar_header_menu_open = false;
         self.sidebar_menu = Some(SidebarMenu {
             target,
             top: f32::from(event.position().y).clamp(8.0, maximum),
@@ -874,6 +1690,22 @@ impl Workspace {
         });
     }
 
+    fn request_remove_resource(
+        &mut self,
+        target: SidebarResource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_resource_dialog(ResourceDialogKind::Remove, target);
+        if self.confirm_destructive_actions {
+            cx.notify();
+        } else {
+            self.submit_resource_dialog(window, cx);
+            self.resource_dialog = None;
+            cx.notify();
+        }
+    }
+
     fn rename_resource(&mut self, _: &RenameResource, _: &mut Window, cx: &mut Context<Self>) {
         if self.resource_dialog.is_some() {
             return;
@@ -884,13 +1716,12 @@ impl Workspace {
         }
     }
 
-    fn remove_shell(&mut self, _: &RemoveShell, _: &mut Window, cx: &mut Context<Self>) {
+    fn remove_shell(&mut self, _: &RemoveShell, window: &mut Window, cx: &mut Context<Self>) {
         if self.resource_dialog.is_some() {
             return;
         }
         if let Some(target @ SidebarResource::Shell { .. }) = self.keyboard_resource() {
-            self.open_resource_dialog(ResourceDialogKind::Remove, target);
-            cx.notify();
+            self.request_remove_resource(target, window, cx);
         }
     }
 
@@ -919,6 +1750,8 @@ impl Workspace {
                 self.fullscreen = None;
             }
         }
+        self.minimizing_panes
+            .retain(|animation| !pane_ids.contains(&animation.pane_id));
         if self
             .pointer_drag
             .as_ref()
@@ -1025,12 +1858,7 @@ impl Workspace {
                                 }
                             }
                         }
-                        this.boomux_shells = overview
-                            .workspaces
-                            .iter()
-                            .flat_map(|workspace| workspace.shells.iter().cloned())
-                            .collect();
-                        this.boomux_overview = overview;
+                        this.set_boomux_overview(overview);
                         this.resource_dialog = None;
                         this.reconcile_sidebar_item();
                     }
@@ -1038,6 +1866,8 @@ impl Workspace {
                         if let Some(dialog) = this.resource_dialog.as_mut() {
                             dialog.busy = false;
                             dialog.error = Some(error);
+                        } else {
+                            this.boomux_error = Some(error);
                         }
                     }
                 }
@@ -1048,11 +1878,13 @@ impl Workspace {
         .detach();
     }
 
-    fn move_direction(&mut self, direction: Direction, cx: &mut Context<Self>) {
+    fn move_direction(&mut self, direction: Direction, window: &Window, cx: &mut Context<Self>) {
         if self.fullscreen.is_some() {
             return;
         }
         self.layout_animation = None;
+        self.floating_animation = None;
+        let panel_size = self.panel_size(window);
         if let Some(floating) = self
             .floating
             .iter_mut()
@@ -1064,8 +1896,7 @@ impl Workspace {
                 Direction::Up => floating.y -= 24.0,
                 Direction::Down => floating.y += 24.0,
             }
-            floating.x = floating.x.max(0.0);
-            floating.y = floating.y.max(0.0);
+            *floating = clamp_floating_to_panel(floating.clone(), panel_size);
         } else if let Some(previous_rects) = self
             .layout
             .as_mut()
@@ -1076,26 +1907,86 @@ impl Workspace {
         cx.notify();
     }
 
-    fn resize_direction(&mut self, direction: Direction, cx: &mut Context<Self>) {
+    fn resize_direction(
+        &mut self,
+        direction: Direction,
+        tiled_amount: f32,
+        floating_amount: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.fullscreen.is_some() {
             return;
         }
         self.layout_animation = None;
+        self.floating_animation = None;
+        let panel_size = self.panel_size(window);
         if let Some(floating) = self
             .floating
             .iter_mut()
             .find(|pane| pane.id == self.focused)
         {
-            match direction {
-                Direction::Left => floating.width = (floating.width - 24.0).max(220.0),
-                Direction::Right => floating.width += 24.0,
-                Direction::Up => floating.height = (floating.height - 24.0).max(160.0),
-                Direction::Down => floating.height += 24.0,
-            }
+            *floating = resize_floating_in_direction(
+                floating.clone(),
+                direction,
+                floating_amount,
+                panel_size,
+            );
         } else {
             if let Some(layout) = &mut self.layout {
-                layout.resize(self.focused, direction, 0.04);
+                layout.resize(self.focused, direction, tiled_amount);
             }
+        }
+        cx.notify();
+    }
+
+    fn transform_nearest_split(
+        &mut self,
+        transform: impl FnOnce(&mut Node, usize) -> bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.fullscreen.is_some() {
+            return;
+        }
+        let Some(layout) = &mut self.layout else {
+            return;
+        };
+        let previous = layout.rects().into_iter().collect::<HashMap<_, _>>();
+        if transform(layout, self.focused) {
+            self.begin_layout_animation(previous);
+            cx.notify();
+        }
+    }
+
+    fn align_floating(
+        &mut self,
+        alignment: FloatingAlignment,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self
+            .floating
+            .iter()
+            .position(|pane| pane.id == self.focused)
+        else {
+            return;
+        };
+        let from = self.floating[index].clone();
+        let target = align_floating_to_panel(
+            from.clone(),
+            alignment,
+            self.panel_size(window),
+            self.pane_gap,
+        );
+        self.floating[index] = target;
+        self.raise_floating_pane(self.focused);
+        if self.motion_speed.duration().is_some() {
+            self.animation_generation = self.animation_generation.wrapping_add(1);
+            self.floating_animation = Some(FloatingAnimation {
+                pane_id: self.focused,
+                from,
+                generation: self.animation_generation,
+            });
         }
         cx.notify();
     }
@@ -1151,86 +2042,261 @@ impl Workspace {
     }
 
     fn close_pane(&mut self, _: &ClosePane, window: &mut Window, cx: &mut Context<Self>) {
+        self.minimize_pane(self.focused, window, cx);
+    }
+
+    fn minimize_pane(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .minimizing_panes
+            .iter()
+            .any(|animation| animation.pane_id == pane_id)
+        {
+            return;
+        }
+        let from = self.pane_bounds_in_panel(pane_id, window);
+        let previous_rects = self
+            .layout
+            .as_ref()
+            .map(|layout| layout.rects().into_iter().collect::<HashMap<_, _>>())
+            .unwrap_or_default();
         self.layout_animation = None;
-        if self.fullscreen == Some(self.focused) {
+        self.floating_animation = None;
+        if self.fullscreen == Some(pane_id) {
             self.fullscreen = None;
         }
-        if let Some(pane) = self.terminals.remove(&self.focused) {
-            for image in pane.render_images.into_values() {
-                let _ = window.drop_image(image);
-            }
-        }
-        if let Some(index) = self
-            .floating
-            .iter()
-            .position(|pane| pane.id == self.focused)
-        {
+        if let Some(index) = self.floating.iter().position(|pane| pane.id == pane_id) {
             self.floating.remove(index);
             self.focus_after_removal();
         } else if self
             .layout
             .as_ref()
-            .is_some_and(|layout| layout.contains(self.focused))
+            .is_some_and(|layout| layout.contains(pane_id))
         {
-            self.layout = self
-                .layout
-                .take()
-                .and_then(|layout| layout.remove(self.focused));
+            self.layout = self.layout.take().and_then(|layout| layout.remove(pane_id));
             self.focus_after_removal();
+        }
+        if !previous_rects.is_empty() {
+            self.begin_layout_animation(previous_rects);
+        }
+
+        if let (Some(duration), Some(from)) = (self.motion_speed.duration(), from) {
+            self.animation_generation = self.animation_generation.wrapping_add(1);
+            let generation = self.animation_generation;
+            self.minimizing_panes.push(PaneMinimizeAnimation {
+                pane_id,
+                from,
+                generation,
+                duration,
+            });
+            let window_handle = window.window_handle();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(duration).await;
+                let _ = window_handle.update(cx, |_, window, cx| {
+                    this.update(cx, |this, cx| {
+                        this.finish_minimize_animation(pane_id, generation, window, cx);
+                    })
+                });
+            })
+            .detach();
+        } else {
+            self.finish_minimize_pane(pane_id, window);
+        }
+        if self.has_minimized_tabs() {
+            let panel_size = self.panel_size(window);
+            for pane in &mut self.floating {
+                *pane = clamp_floating_to_panel(pane.clone(), panel_size);
+            }
         }
         cx.notify();
     }
 
-    fn toggle_floating(&mut self, _: &ToggleFloating, _: &mut Window, cx: &mut Context<Self>) {
+    fn finish_minimize_animation(
+        &mut self,
+        pane_id: usize,
+        generation: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.minimizing_panes.iter().position(|animation| {
+            animation.pane_id == pane_id && animation.generation == generation
+        }) else {
+            return;
+        };
+        self.minimizing_panes.remove(index);
+        self.finish_minimize_pane(pane_id, window);
+        if self.has_minimized_tabs() {
+            let panel_size = self.panel_size(window);
+            for pane in &mut self.floating {
+                *pane = clamp_floating_to_panel(pane.clone(), panel_size);
+            }
+        }
+        cx.notify();
+    }
+
+    fn finish_minimize_pane(&mut self, pane_id: usize, window: &mut Window) {
+        if let Some(pane) = self.terminals.remove(&pane_id) {
+            if let Some(shell) = &pane.shell {
+                self.minimized_shells.insert(shell.id.clone());
+            }
+            for image in pane.render_images.into_values() {
+                let _ = window.drop_image(image);
+            }
+        }
+    }
+
+    fn request_pane_shell_dialog(
+        &mut self,
+        pane_id: usize,
+        kind: ResourceDialogKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self
+            .terminals
+            .get(&pane_id)
+            .and_then(|pane| pane.shell.as_ref())
+            .map(|shell| SidebarResource::Shell {
+                id: shell.id.clone(),
+                workspace_id: shell.workspace_id.clone(),
+                name: shell.name.clone(),
+            });
+        if let Some(target) = target {
+            if kind == ResourceDialogKind::Remove {
+                self.request_remove_resource(target, window, cx);
+            } else {
+                self.open_resource_dialog(kind, target);
+                cx.notify();
+            }
+        }
+    }
+
+    fn scroll_minimized_tabs(&mut self, direction: i8, cx: &mut Context<Self>) {
+        let current = self.minimized_tab_scroll_handle.offset();
+        let maximum = self.minimized_tab_scroll_handle.max_offset();
+        let next_x = if direction < 0 {
+            (current.x + px(204.0)).min(px(0.0))
+        } else {
+            (current.x - px(204.0)).max(-maximum.x)
+        };
+        self.minimized_tab_scroll_handle
+            .set_offset(point(next_x, current.y));
+        cx.notify();
+    }
+
+    fn toggle_floating(&mut self, _: &ToggleFloating, window: &mut Window, cx: &mut Context<Self>) {
         self.layout_animation = None;
+        self.floating_animation = None;
         if let Some(index) = self
             .floating
             .iter()
             .position(|pane| pane.id == self.focused)
         {
             let pane = self.floating.remove(index);
+            let mut previous_rects = self
+                .layout
+                .as_ref()
+                .map(|layout| layout.rects().into_iter().collect::<HashMap<_, _>>())
+                .unwrap_or_default();
+            let (panel_width, panel_height) = self.panel_size(window);
+            let (inner_width, inner_height) =
+                inset_panel_size((panel_width, panel_height), self.pane_gap);
+            previous_rects.insert(
+                pane.id,
+                Rect {
+                    x: ((pane.x - self.pane_gap) / inner_width).clamp(0.0, 1.0),
+                    y: ((pane.y - self.pane_gap) / inner_height).clamp(0.0, 1.0),
+                    width: (pane.width / inner_width).clamp(0.0, 1.0),
+                    height: (pane.height / inner_height).clamp(0.0, 1.0),
+                },
+            );
             if let Some(layout) = &mut self.layout {
                 let target = layout.pane_ids()[0];
                 layout.split(target, pane.id, Axis::Horizontal);
             } else {
                 self.layout = Some(Node::pane(pane.id));
             }
+            self.begin_layout_animation(previous_rects);
         } else if self
             .layout
             .as_ref()
             .is_some_and(|layout| layout.contains(self.focused))
         {
             let id = self.focused;
-            self.layout = self.layout.take().and_then(|layout| layout.remove(id));
-            let offset = self.floating.len() as f32 * 28.0;
-            self.floating.push(FloatingPane {
-                id,
-                x: 110.0 + offset,
-                y: 80.0 + offset,
-                width: 440.0,
-                height: 270.0,
-            });
+            if let Some(from) = self.lift_tiled_pane(id, window) {
+                let target = centered_floating_pane(id, self.panel_size(window), self.pane_gap);
+                if let Some(pane) = self.floating.iter_mut().find(|pane| pane.id == id) {
+                    *pane = target;
+                }
+                if self.motion_speed.duration().is_some() {
+                    self.animation_generation = self.animation_generation.wrapping_add(1);
+                    self.floating_animation = Some(FloatingAnimation {
+                        pane_id: id,
+                        from,
+                        generation: self.animation_generation,
+                    });
+                }
+            }
         }
         cx.notify();
     }
 
-    fn toggle_fullscreen(&mut self, _: &ToggleFullscreen, _: &mut Window, cx: &mut Context<Self>) {
-        if self.pointer_drag.is_some() {
+    fn toggle_fullscreen(
+        &mut self,
+        _: &ToggleFullscreen,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pointer_drag.is_some() || self.terminal_scrollbar_drag.is_some() {
             return;
         }
 
-        self.fullscreen = match self.fullscreen {
-            Some(_) => None,
-            None if self
-                .layout
-                .as_ref()
-                .is_some_and(|layout| layout.contains(self.focused))
-                || self.floating.iter().any(|pane| pane.id == self.focused) =>
-            {
-                Some(self.focused)
+        if let Some(id) = self.fullscreen.take() {
+            if let Some(layout) = self.layout.as_ref().filter(|layout| layout.contains(id)) {
+                let from = workspace_layout_rects(layout, Some(id))
+                    .into_iter()
+                    .collect();
+                self.floating_animation = None;
+                self.begin_layout_animation(from);
+                if let Some(animation) = &mut self.layout_animation {
+                    animation.paint_last = Some(id);
+                }
+            } else if self.floating.iter().any(|pane| pane.id == id) {
+                self.layout_animation = None;
+                if self.motion_speed.duration().is_some() {
+                    self.animation_generation = self.animation_generation.wrapping_add(1);
+                    self.floating_animation = Some(FloatingAnimation {
+                        pane_id: id,
+                        from: workspace_maximized_pane(id, self.panel_size(window), self.pane_gap),
+                        generation: self.animation_generation,
+                    });
+                } else {
+                    self.floating_animation = None;
+                }
             }
-            None => None,
-        };
+            cx.notify();
+            return;
+        }
+
+        let id = self.focused;
+        if let Some(layout) = self.layout.as_ref().filter(|layout| layout.contains(id)) {
+            let from = workspace_layout_rects(layout, None).into_iter().collect();
+            self.fullscreen = Some(id);
+            self.floating_animation = None;
+            self.begin_layout_animation(from);
+        } else if let Some(pane) = self.floating.iter().find(|pane| pane.id == id).cloned() {
+            self.fullscreen = Some(id);
+            self.layout_animation = None;
+            if self.motion_speed.duration().is_some() {
+                self.animation_generation = self.animation_generation.wrapping_add(1);
+                self.floating_animation = Some(FloatingAnimation {
+                    pane_id: id,
+                    from: pane,
+                    generation: self.animation_generation,
+                });
+            } else {
+                self.floating_animation = None;
+            }
+        }
         cx.notify();
     }
 
@@ -1242,16 +2308,66 @@ impl Workspace {
         }
     }
 
-    fn panel_size(window: &Window) -> (f32, f32) {
+    fn sidebar_width(&self) -> f32 {
+        if self.sidebar_visible {
+            SIDEBAR_WIDTH
+        } else {
+            0.0
+        }
+    }
+
+    fn panel_size(&self, window: &Window) -> (f32, f32) {
         let viewport = window.viewport_size();
+        let tab_bar_height = if self.has_minimized_tabs() {
+            TAB_BAR_HEIGHT
+        } else {
+            0.0
+        };
         (
-            (f32::from(viewport.width) - SIDEBAR_WIDTH).max(0.0),
-            (f32::from(viewport.height) - HEADER_HEIGHT - FOOTER_HEIGHT).max(0.0),
+            (f32::from(viewport.width) - self.sidebar_width()).max(0.0),
+            (f32::from(viewport.height) - tab_bar_height).max(0.0),
         )
     }
 
-    fn pointer_in_panel(event: &MouseDownEvent) -> (f32, f32) {
-        window_point_to_panel(f32::from(event.position.x), f32::from(event.position.y))
+    fn pane_bounds_in_panel(&self, pane_id: usize, window: &Window) -> Option<FloatingPane> {
+        if self.fullscreen == Some(pane_id) {
+            return Some(workspace_maximized_pane(
+                pane_id,
+                self.panel_size(window),
+                self.pane_gap,
+            ));
+        }
+        if let Some(pane) = self.floating.iter().find(|pane| pane.id == pane_id) {
+            return Some(pane.clone());
+        }
+        let rect = self
+            .layout
+            .as_ref()?
+            .rects()
+            .into_iter()
+            .find_map(|(id, rect)| (id == pane_id).then_some(rect))?;
+        let (panel_width, panel_height) = self.panel_size(window);
+        let (inner_width, inner_height) =
+            inset_panel_size((panel_width, panel_height), self.pane_gap);
+        Some(FloatingPane {
+            id: pane_id,
+            x: self.pane_gap + rect.x * inner_width,
+            y: self.pane_gap + rect.y * inner_height,
+            width: (rect.width * inner_width - self.pane_gap).max(1.0),
+            height: (rect.height * inner_height - self.pane_gap).max(1.0),
+        })
+    }
+
+    fn pointer_in_panel(&self, event: &MouseDownEvent) -> (f32, f32) {
+        self.window_position_in_panel(f32::from(event.position.x), f32::from(event.position.y))
+    }
+
+    fn window_position_in_panel(&self, x: f32, y: f32) -> (f32, f32) {
+        let mut pointer = window_point_to_panel(x, y, self.sidebar_width());
+        if self.has_minimized_tabs() {
+            pointer.1 -= TAB_BAR_HEIGHT;
+        }
+        pointer
     }
 
     fn pointer_subject(&mut self, id: usize) -> Option<PointerSubject> {
@@ -1269,41 +2385,48 @@ impl Workspace {
     }
 
     fn begin_layout_animation(&mut self, from: HashMap<usize, Rect>) {
+        if self.motion_speed.duration().is_none() {
+            self.layout_animation = None;
+            return;
+        }
         self.animation_generation = self.animation_generation.wrapping_add(1);
         self.layout_animation = Some(LayoutAnimation {
             from,
             generation: self.animation_generation,
+            // Match compositor behavior: the pane being manipulated stays
+            // visually above its siblings for the entire transition.
+            paint_last: Some(self.focused),
         });
     }
 
-    fn normalized_panel_point(pointer: (f32, f32), window: &Window) -> (f32, f32) {
-        let (panel_width, panel_height) = Self::panel_size(window);
-        let inner_width = (panel_width - PANEL_PADDING * 2.0).max(1.0);
-        let inner_height = (panel_height - PANEL_PADDING * 2.0).max(1.0);
+    fn normalized_panel_point(&self, pointer: (f32, f32), window: &Window) -> (f32, f32) {
+        let (panel_width, panel_height) = self.panel_size(window);
+        let (inner_width, inner_height) =
+            inset_panel_size((panel_width, panel_height), self.pane_gap);
         (
-            ((pointer.0 - PANEL_PADDING) / inner_width).clamp(0.0, 1.0),
-            ((pointer.1 - PANEL_PADDING) / inner_height).clamp(0.0, 1.0),
+            ((pointer.0 - self.pane_gap) / inner_width).clamp(0.0, 1.0),
+            ((pointer.1 - self.pane_gap) / inner_height).clamp(0.0, 1.0),
         )
     }
 
     fn lift_tiled_pane(&mut self, id: usize, window: &Window) -> Option<FloatingPane> {
         let layout = self.layout.as_ref()?;
         let previous_rects = layout.rects().into_iter().collect::<HashMap<_, _>>();
-        let (panel_width, panel_height) = Self::panel_size(window);
-        let inner_width = (panel_width - PANEL_PADDING * 2.0).max(0.0);
-        let inner_height = (panel_height - PANEL_PADDING * 2.0).max(0.0);
+        let (panel_width, panel_height) = self.panel_size(window);
+        let (inner_width, inner_height) =
+            inset_panel_size((panel_width, panel_height), self.pane_gap);
         let (_, rect) = layout
             .rects()
             .into_iter()
             .find(|(pane_id, _)| *pane_id == id)?;
         let pane = FloatingPane {
             id,
-            x: PANEL_PADDING + rect.x * inner_width,
-            y: PANEL_PADDING + rect.y * inner_height,
-            width: (rect.width * inner_width - PANEL_PADDING)
+            x: self.pane_gap + rect.x * inner_width,
+            y: self.pane_gap + rect.y * inner_height,
+            width: (rect.width * inner_width - self.pane_gap)
                 .max(MIN_FLOAT_WIDTH)
                 .min(inner_width),
-            height: (rect.height * inner_height - PANEL_PADDING)
+            height: (rect.height * inner_height - self.pane_gap)
                 .max(MIN_FLOAT_HEIGHT)
                 .min(inner_height),
         };
@@ -1333,21 +2456,21 @@ impl Workspace {
             .map(|layout| layout.rects().into_iter().collect::<HashMap<_, _>>())
             .unwrap_or_default();
         if let Some(pane) = &dragged_pane {
-            let (panel_width, panel_height) = Self::panel_size(window);
-            let inner_width = (panel_width - PANEL_PADDING * 2.0).max(1.0);
-            let inner_height = (panel_height - PANEL_PADDING * 2.0).max(1.0);
+            let (panel_width, panel_height) = self.panel_size(window);
+            let (inner_width, inner_height) =
+                inset_panel_size((panel_width, panel_height), self.pane_gap);
             previous_rects.insert(
                 pane.id,
                 Rect {
-                    x: ((pane.x - PANEL_PADDING) / inner_width).clamp(0.0, 1.0),
-                    y: ((pane.y - PANEL_PADDING) / inner_height).clamp(0.0, 1.0),
+                    x: ((pane.x - self.pane_gap) / inner_width).clamp(0.0, 1.0),
+                    y: ((pane.y - self.pane_gap) / inner_height).clamp(0.0, 1.0),
                     width: (pane.width / inner_width).clamp(0.0, 1.0),
                     height: (pane.height / inner_height).clamp(0.0, 1.0),
                 },
             );
         }
         self.floating.retain(|pane| pane.id != drag.pane_id);
-        let point = Self::normalized_panel_point(pointer, window);
+        let point = self.normalized_panel_point(pointer, window);
         if let Some(layout) = &mut self.layout {
             if let Some((target, axis, before)) = drop_placement(layout, point) {
                 layout.split_at(target, drag.pane_id, axis, before);
@@ -1368,7 +2491,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.floating_animation = None;
         self.focused = id;
+        self.raise_floating_pane(id);
         self.navigation_region = NavigationRegion::Terminal;
         window.focus(&self.focus_handle, cx);
         if let Some(terminal) = self
@@ -1400,7 +2525,7 @@ impl Workspace {
         self.pointer_drag = Some(PointerDrag {
             operation,
             button: event.button,
-            start_pointer: Self::pointer_in_panel(event),
+            start_pointer: self.pointer_in_panel(event),
             pane_id: id,
             subject,
             activated: false,
@@ -1412,18 +2537,30 @@ impl Workspace {
     fn focus_pane_on_hover(
         &mut self,
         id: usize,
-        _: &MouseMoveEvent,
+        event: &MouseMoveEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // Keep the dragged pane focused even while it crosses other panes.
-        if self.pointer_drag.is_some() {
+        if self.pointer_drag.is_some() || self.terminal_scrollbar_drag.is_some() {
+            return;
+        }
+        if self.navigation_region == NavigationRegion::Sidebar
+            && self.sidebar_focus_pointer.is_some_and(|anchor| {
+                !pointer_moved_from(
+                    anchor,
+                    (f32::from(event.position.x), f32::from(event.position.y)),
+                )
+            })
+        {
             return;
         }
         if self.focused == id && self.navigation_region == NavigationRegion::Terminal {
             return;
         }
+        self.sidebar_focus_pointer = None;
         self.focused = id;
+        self.raise_floating_pane(id);
         self.navigation_region = NavigationRegion::Terminal;
         window.focus(&self.focus_handle, cx);
         if let Some(terminal) = self
@@ -1472,36 +2609,69 @@ impl Workspace {
         }
     }
 
-    fn drag_terminal_scrollbar(
+    fn begin_terminal_scrollbar_drag(
         &mut self,
-        event: &DragMoveEvent<TerminalScrollbarDrag>,
-        _: &mut Window,
+        pane_id: usize,
+        event: &MouseDownEvent,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let pane_id = event.drag(cx).0;
         let Some(pane) = self.terminals.get(&pane_id) else {
             return;
         };
-        let Some(terminal) = &pane.session else {
+        if pane.session.is_none() {
             return;
-        };
+        }
         let Some(screen) = &pane.screen else {
             return;
         };
-        let maximum = screen.scroll_total.saturating_sub(screen.scroll_len);
-        if maximum == 0 || event.bounds.size.height <= px(0.0) {
+        let maximum_offset = screen.scroll_total.saturating_sub(screen.scroll_len) as usize;
+        if maximum_offset == 0 {
             return;
         }
-
-        let pointer = f32::from(event.event.position.y - event.bounds.top());
-        let track_height = f32::from(event.bounds.size.height);
+        let track_height = f32::from(screen.rows) * TERMINAL_CELL_HEIGHT + TERMINAL_PADDING;
         let thumb_fraction = scrollbar_thumb_fraction(screen, track_height);
-        let progress = ((pointer / track_height - thumb_fraction / 2.0)
-            / (1.0 - thumb_fraction).max(f32::EPSILON))
-        .clamp(0.0, 1.0);
-        let row = (progress * maximum as f32).round() as usize;
-        terminal.scroll_to(row);
+        self.terminal_scrollbar_drag = Some(TerminalScrollbarPointerDrag {
+            pane_id,
+            start_pointer_y: f32::from(event.position.y),
+            start_offset: (screen.scroll_offset as usize).min(maximum_offset),
+            maximum_offset,
+            travel_height: track_height * (1.0 - thumb_fraction),
+        });
+        self.focused = pane_id;
+        self.navigation_region = NavigationRegion::Terminal;
+        if let Some(pane) = self.terminals.get_mut(&pane_id)
+            && !pane.scrollbar_hovered
+        {
+            pane.scrollbar_hovered = true;
+            pane.scrollbar_fade_generation = pane.scrollbar_fade_generation.wrapping_add(1);
+        }
+        window.focus(&self.focus_handle, cx);
         cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn set_terminal_scrollbar_hover(
+        &mut self,
+        pane_id: usize,
+        hovered: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pane) = self.terminals.get_mut(&pane_id) else {
+            return;
+        };
+        if pane.scrollbar_hovered == hovered {
+            return;
+        }
+        pane.scrollbar_hovered = hovered;
+        let dragging = self
+            .terminal_scrollbar_drag
+            .as_ref()
+            .is_some_and(|drag| drag.pane_id == pane_id);
+        if hovered || !dragging {
+            pane.scrollbar_fade_generation = pane.scrollbar_fade_generation.wrapping_add(1);
+        }
+        cx.notify();
     }
 
     fn drag_terminal_selection(
@@ -1604,8 +2774,29 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(drag) = self.terminal_scrollbar_drag.clone() {
+            if event.pressed_button != Some(MouseButton::Left) {
+                self.terminal_scrollbar_drag = None;
+                return;
+            }
+            let offset = scrollbar_offset_from_drag(
+                drag.start_offset,
+                drag.maximum_offset,
+                f32::from(event.position.y) - drag.start_pointer_y,
+                drag.travel_height,
+            );
+            if let Some(terminal) = self
+                .terminals
+                .get(&drag.pane_id)
+                .and_then(|pane| pane.session.as_ref())
+            {
+                terminal.scroll_to(offset);
+            }
+            cx.stop_propagation();
+            return;
+        }
         let pointer =
-            window_point_to_panel(f32::from(event.position.x), f32::from(event.position.y));
+            self.window_position_in_panel(f32::from(event.position.x), f32::from(event.position.y));
         let Some(mut drag) = self.pointer_drag.clone() else {
             return;
         };
@@ -1633,7 +2824,7 @@ impl Workspace {
             }
             self.pointer_drag = Some(drag.clone());
         }
-        let (panel_width, panel_height) = Self::panel_size(window);
+        let (panel_width, panel_height) = self.panel_size(window);
 
         match drag.subject {
             PointerSubject::Floating(start_bounds) | PointerSubject::Lifted(start_bounds) => {
@@ -1673,8 +2864,18 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(drag) = self.terminal_scrollbar_drag.take() {
+            if let Some(pane) = self.terminals.get_mut(&drag.pane_id)
+                && !pane.scrollbar_hovered
+            {
+                pane.scrollbar_fade_generation = pane.scrollbar_fade_generation.wrapping_add(1);
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         let pointer =
-            window_point_to_panel(f32::from(event.position.x), f32::from(event.position.y));
+            self.window_position_in_panel(f32::from(event.position.x), f32::from(event.position.y));
         self.finish_pointer_drag(pointer, window);
         cx.notify();
     }
@@ -1691,29 +2892,146 @@ impl Workspace {
     fn focus_down(&mut self, _: &FocusDown, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_direction(Direction::Down, window, cx);
     }
-    fn move_left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_direction(Direction::Left, cx);
+    fn move_left(&mut self, _: &MoveLeft, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_direction(Direction::Left, window, cx);
     }
-    fn move_right(&mut self, _: &MoveRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_direction(Direction::Right, cx);
+    fn move_right(&mut self, _: &MoveRight, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_direction(Direction::Right, window, cx);
     }
-    fn move_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_direction(Direction::Up, cx);
+    fn move_up(&mut self, _: &MoveUp, window: &mut Window, cx: &mut Context<Self>) {
+        if self.navigation_region == NavigationRegion::Sidebar {
+            self.move_selected_workspace(-1, cx);
+            return;
+        }
+        self.move_direction(Direction::Up, window, cx);
     }
-    fn move_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_direction(Direction::Down, cx);
+    fn move_down(&mut self, _: &MoveDown, window: &mut Window, cx: &mut Context<Self>) {
+        if self.navigation_region == NavigationRegion::Sidebar {
+            self.move_selected_workspace(1, cx);
+            return;
+        }
+        self.move_direction(Direction::Down, window, cx);
     }
-    fn resize_left(&mut self, _: &ResizeLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.resize_direction(Direction::Left, cx);
+    fn resize_left(&mut self, _: &ResizeLeft, window: &mut Window, cx: &mut Context<Self>) {
+        self.resize_direction(Direction::Left, 0.04, 32.0, window, cx);
     }
-    fn resize_right(&mut self, _: &ResizeRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.resize_direction(Direction::Right, cx);
+    fn resize_right(&mut self, _: &ResizeRight, window: &mut Window, cx: &mut Context<Self>) {
+        self.resize_direction(Direction::Right, 0.04, 32.0, window, cx);
     }
-    fn resize_up(&mut self, _: &ResizeUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.resize_direction(Direction::Up, cx);
+    fn resize_up(&mut self, _: &ResizeUp, window: &mut Window, cx: &mut Context<Self>) {
+        self.resize_direction(Direction::Up, 0.04, 32.0, window, cx);
     }
-    fn resize_down(&mut self, _: &ResizeDown, _: &mut Window, cx: &mut Context<Self>) {
-        self.resize_direction(Direction::Down, cx);
+    fn resize_down(&mut self, _: &ResizeDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.resize_direction(Direction::Down, 0.04, 32.0, window, cx);
+    }
+    fn resize_small_left(
+        &mut self,
+        _: &ResizeSmallLeft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.resize_direction(Direction::Left, 0.015, 12.0, window, cx);
+    }
+    fn resize_small_right(
+        &mut self,
+        _: &ResizeSmallRight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.resize_direction(Direction::Right, 0.015, 12.0, window, cx);
+    }
+    fn resize_small_up(&mut self, _: &ResizeSmallUp, window: &mut Window, cx: &mut Context<Self>) {
+        self.resize_direction(Direction::Up, 0.015, 12.0, window, cx);
+    }
+    fn resize_small_down(
+        &mut self,
+        _: &ResizeSmallDown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.resize_direction(Direction::Down, 0.015, 12.0, window, cx);
+    }
+    fn resize_large_left(
+        &mut self,
+        _: &ResizeLargeLeft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.resize_direction(Direction::Left, 0.12, 96.0, window, cx);
+    }
+    fn resize_large_right(
+        &mut self,
+        _: &ResizeLargeRight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.resize_direction(Direction::Right, 0.12, 96.0, window, cx);
+    }
+    fn resize_large_up(&mut self, _: &ResizeLargeUp, window: &mut Window, cx: &mut Context<Self>) {
+        self.resize_direction(Direction::Up, 0.12, 96.0, window, cx);
+    }
+    fn resize_large_down(
+        &mut self,
+        _: &ResizeLargeDown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.resize_direction(Direction::Down, 0.12, 96.0, window, cx);
+    }
+    fn toggle_split(&mut self, _: &ToggleSplit, _: &mut Window, cx: &mut Context<Self>) {
+        self.transform_nearest_split(Node::toggle_split, cx);
+    }
+    fn equalize_split(&mut self, _: &EqualizeSplit, _: &mut Window, cx: &mut Context<Self>) {
+        self.transform_nearest_split(Node::equalize_split, cx);
+    }
+    fn swap_split(&mut self, _: &SwapSplit, _: &mut Window, cx: &mut Context<Self>) {
+        self.transform_nearest_split(Node::swap_split, cx);
+    }
+    fn align_floating_left(
+        &mut self,
+        _: &AlignFloatingLeft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.align_floating(FloatingAlignment::Left, window, cx);
+    }
+    fn align_floating_right(
+        &mut self,
+        _: &AlignFloatingRight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.align_floating(FloatingAlignment::Right, window, cx);
+    }
+    fn align_floating_up(
+        &mut self,
+        _: &AlignFloatingUp,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.align_floating(FloatingAlignment::Up, window, cx);
+    }
+    fn align_floating_down(
+        &mut self,
+        _: &AlignFloatingDown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.align_floating(FloatingAlignment::Down, window, cx);
+    }
+    fn center_floating(&mut self, _: &CenterFloating, window: &mut Window, cx: &mut Context<Self>) {
+        self.align_floating(FloatingAlignment::Center, window, cx);
+    }
+    fn cycle_pane_next(&mut self, _: &CyclePaneNext, window: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_pane(false, window, cx);
+    }
+    fn cycle_pane_previous(
+        &mut self,
+        _: &CyclePanePrevious,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cycle_pane(true, window, cx);
     }
 
     fn move_sidebar_selection(
@@ -1722,7 +3040,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let visible = visible_sidebar_items(&self.boomux_overview, &self.expanded_workspaces);
+        let visible = self.sidebar_navigation_items();
         if visible.is_empty() {
             self.sidebar_item = None;
             return;
@@ -1741,7 +3059,7 @@ impl Workspace {
     }
 
     fn move_sidebar_to_edge(&mut self, last: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let visible = visible_sidebar_items(&self.boomux_overview, &self.expanded_workspaces);
+        let visible = self.sidebar_navigation_items();
         self.sidebar_item = if last {
             visible.last().cloned()
         } else {
@@ -1777,7 +3095,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let visible = visible_sidebar_items(&self.boomux_overview, &self.expanded_workspaces);
+        let visible = self.sidebar_navigation_items();
         let in_agents = matches!(self.sidebar_item, Some(SidebarItem::Agent { .. }));
         let target = if in_agents {
             if backwards {
@@ -1814,7 +3132,9 @@ impl Workspace {
             return;
         };
         match item {
-            SidebarItem::Workspace(workspace_id) => self.toggle_workspace(&workspace_id, cx),
+            SidebarItem::Workspace(workspace_id) => {
+                self.open_workspace(&workspace_id, None, window, cx)
+            }
             SidebarItem::Shell { shell_id, .. } | SidebarItem::Agent { shell_id, .. } => {
                 self.activate_sidebar_shell(&shell_id, window, cx);
             }
@@ -1860,8 +3180,16 @@ impl Workspace {
                 self.jump_sidebar_section(modifiers.shift, window, cx);
                 true
             }
-            "enter" | "space" => {
+            "enter" => {
                 self.activate_sidebar_item(window, cx);
+                true
+            }
+            "space" => {
+                if let Some(SidebarItem::Workspace(workspace_id)) = self.sidebar_item.clone() {
+                    self.toggle_workspace(&workspace_id, cx);
+                } else {
+                    self.activate_sidebar_item(window, cx);
+                }
                 true
             }
             "escape" => {
@@ -1889,8 +3217,20 @@ impl Workspace {
             self.resource_dialog_key_down(event, window, cx);
             return;
         }
+        if self.settings_open && event.keystroke.key == "escape" {
+            self.settings_open = false;
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if self.sidebar_menu.is_some() && event.keystroke.key == "escape" {
             self.sidebar_menu = None;
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if self.sidebar_header_menu_open && event.keystroke.key == "escape" {
+            self.sidebar_header_menu_open = false;
             cx.stop_propagation();
             cx.notify();
             return;
@@ -1961,6 +3301,7 @@ impl Workspace {
         let Some(pane) = self.terminals.get_mut(&pane_id) else {
             return;
         };
+        pane.shell = Some(shell.clone());
         pane.attaching = true;
         pane.error = None;
         cx.notify();
@@ -2040,12 +3381,7 @@ impl Workspace {
                         pane.shell = Some(shell);
                         pane.session = Some(session);
                         if let Some(overview) = overview {
-                            this.boomux_shells = overview
-                                .workspaces
-                                .iter()
-                                .flat_map(|workspace| workspace.shells.iter().cloned())
-                                .collect();
-                            this.boomux_overview = overview;
+                            this.set_boomux_overview(overview);
                         }
                         this.watch_terminal(pane_id, shell_id, cx);
                     }
@@ -2061,15 +3397,42 @@ impl Workspace {
     fn create_and_attach_workspace_terminal(
         &mut self,
         workspace_id: String,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.workspace_pane_mode == WorkspacePaneMode::Workspace {
+            self.open_workspace(&workspace_id, None, window, cx);
+        }
         self.sidebar_menu = None;
         self.navigation_region = NavigationRegion::Terminal;
         self.fullscreen = None;
         self.layout_animation = None;
+        let mut previous_rects = self
+            .layout
+            .as_ref()
+            .map(|layout| layout.rects().into_iter().collect::<HashMap<_, _>>())
+            .unwrap_or_default();
         let pane_id = self.insert_pane();
         self.focused = pane_id;
+        if self.motion_speed.duration().is_some()
+            && let Some(target) = self.layout.as_ref().and_then(|layout| {
+                layout
+                    .rects()
+                    .into_iter()
+                    .find_map(|(id, rect)| (id == pane_id).then_some(rect))
+            })
+        {
+            previous_rects.insert(
+                pane_id,
+                Rect {
+                    x: target.x + target.width / 2.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                },
+            );
+            self.begin_layout_animation(previous_rects);
+        }
         let size = self.terminal_grid_size(pane_id, window);
         if let Some(pane) = self.terminals.get_mut(&pane_id) {
             pane.attaching = true;
@@ -2108,12 +3471,7 @@ impl Workspace {
                         pane.shell = Some(shell);
                         pane.session = Some(session);
                         if let Some(overview) = overview {
-                            this.boomux_shells = overview
-                                .workspaces
-                                .iter()
-                                .flat_map(|workspace| workspace.shells.iter().cloned())
-                                .collect();
-                            this.boomux_overview = overview;
+                            this.set_boomux_overview(overview);
                         }
                         this.watch_terminal(pane_id, shell_id, cx);
                     }
@@ -2126,11 +3484,14 @@ impl Workspace {
         .detach();
     }
 
-    fn create_and_attach_new_workspace(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn create_and_attach_new_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_menu = None;
         self.navigation_region = NavigationRegion::Terminal;
         self.fullscreen = None;
         self.layout_animation = None;
+        if self.workspace_pane_mode == WorkspacePaneMode::Workspace {
+            self.detach_all_panes(window);
+        }
         let pane_id = self.insert_pane();
         self.focused = pane_id;
         let size = self.terminal_grid_size(pane_id, window);
@@ -2173,14 +3534,16 @@ impl Workspace {
                         pane.screen = Some(Arc::new(session.screen()));
                         pane.shell = Some(shell);
                         pane.session = Some(session);
-                        this.expanded_workspaces.insert(workspace_id);
+                        reveal_opened_workspace(
+                            this.workspace_pane_mode,
+                            &mut this.expanded_workspaces,
+                            &workspace_id,
+                        );
+                        if !this.workspace_order.contains(&workspace_id) {
+                            this.workspace_order.push(workspace_id.clone());
+                        }
                         if let Some(overview) = overview {
-                            this.boomux_shells = overview
-                                .workspaces
-                                .iter()
-                                .flat_map(|workspace| workspace.shells.iter().cloned())
-                                .collect();
-                            this.boomux_overview = overview;
+                            this.set_boomux_overview(overview);
                         }
                         this.watch_terminal(pane_id, shell_id, cx);
                     }
@@ -2202,20 +3565,16 @@ impl Workspace {
                     .await;
                 let keep_watching = this
                     .update(cx, |this, cx| {
-                        if let Ok(overview) = result
-                            && (overview != this.boomux_overview || this.boomux_error.is_some())
-                        {
-                            this.boomux_shells = overview
-                                .workspaces
-                                .iter()
-                                .flat_map(|workspace| workspace.shells.iter().cloned())
-                                .collect();
-                            this.boomux_overview = overview;
-                            this.boomux_error = None;
-                            if this.navigation_region == NavigationRegion::Sidebar {
-                                this.reconcile_sidebar_item();
+                        if let Ok(mut overview) = result {
+                            reconcile_workspace_order(&mut this.workspace_order, &mut overview);
+                            if overview != this.boomux_overview || this.boomux_error.is_some() {
+                                this.set_boomux_overview(overview);
+                                this.boomux_error = None;
+                                if this.navigation_region == NavigationRegion::Sidebar {
+                                    this.reconcile_sidebar_item();
+                                }
+                                cx.notify();
                             }
-                            cx.notify();
                         }
                         true
                     })
@@ -2235,21 +3594,188 @@ impl Workspace {
         cx.notify();
     }
 
+    fn retain_known_minimized_shells(&mut self, overview: &BoomuxOverview) {
+        let known_shells = overview
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.shells.iter().map(|shell| shell.id.as_str()))
+            .collect::<HashSet<_>>();
+        self.minimized_shells
+            .retain(|shell_id| known_shells.contains(shell_id.as_str()));
+    }
+
+    fn minimized_tab_shells(&self) -> Vec<ShellChoice> {
+        if self.pane_layout_mode != PaneLayoutMode::Tabbed {
+            return Vec::new();
+        }
+        let focused_workspace_id = self
+            .terminals
+            .get(&self.focused)
+            .and_then(|pane| pane.shell.as_ref())
+            .map(|shell| shell.workspace_id.as_str());
+        self.boomux_overview
+            .workspaces
+            .iter()
+            .filter(|workspace| {
+                focused_workspace_id == Some(workspace.id.as_str())
+                    || (focused_workspace_id.is_none()
+                        && self.expanded_workspaces.contains(&workspace.id))
+            })
+            .flat_map(|workspace| workspace.shells.iter())
+            .filter(|shell| self.minimized_shells.contains(&shell.id))
+            .cloned()
+            .collect()
+    }
+
+    fn has_minimized_tabs(&self) -> bool {
+        if self.pane_layout_mode != PaneLayoutMode::Tabbed {
+            return false;
+        }
+        let focused_workspace_id = self
+            .terminals
+            .get(&self.focused)
+            .and_then(|pane| pane.shell.as_ref())
+            .map(|shell| shell.workspace_id.as_str());
+        self.boomux_overview.workspaces.iter().any(|workspace| {
+            (focused_workspace_id == Some(workspace.id.as_str())
+                || (focused_workspace_id.is_none()
+                    && self.expanded_workspaces.contains(&workspace.id)))
+                && workspace
+                    .shells
+                    .iter()
+                    .any(|shell| self.minimized_shells.contains(&shell.id))
+        })
+    }
+
+    fn detach_all_panes(&mut self, window: &mut Window) {
+        for (_, pane) in self.terminals.drain() {
+            for image in pane.render_images.into_values() {
+                let _ = window.drop_image(image);
+            }
+        }
+        self.layout = None;
+        self.floating.clear();
+        self.pointer_drag = None;
+        self.terminal_scrollbar_drag = None;
+        self.layout_animation = None;
+        self.floating_animation = None;
+        self.minimizing_panes.clear();
+        self.fullscreen = None;
+    }
+
+    fn open_workspace(
+        &mut self,
+        workspace_id: &str,
+        preferred_shell_id: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(shells) = self
+            .boomux_overview
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .map(|workspace| {
+                workspace
+                    .shells
+                    .iter()
+                    .filter(|shell| !shell_is_minimized(&self.minimized_shells, &shell.id))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+        else {
+            self.boomux_error = Some("That Boomux workspace is no longer available".into());
+            cx.notify();
+            return;
+        };
+
+        self.sidebar_menu = None;
+        reveal_opened_workspace(
+            self.workspace_pane_mode,
+            &mut self.expanded_workspaces,
+            workspace_id,
+        );
+        if self.workspace_pane_mode == WorkspacePaneMode::Workspace {
+            let desired = shells
+                .iter()
+                .map(|shell| shell.id.clone())
+                .collect::<HashSet<_>>();
+            let current = self
+                .terminals
+                .values()
+                .filter_map(|pane| pane.shell.as_ref().map(|shell| shell.id.clone()))
+                .collect::<HashSet<_>>();
+            if workspace_open_replaces_panes(self.workspace_pane_mode, &current, &desired) {
+                self.detach_all_panes(window);
+            }
+        }
+
+        let mut pane_ids = HashMap::new();
+        for (pane_id, pane) in &self.terminals {
+            if let Some(shell) = &pane.shell {
+                pane_ids.insert(shell.id.clone(), *pane_id);
+            }
+        }
+
+        let mut pending = Vec::new();
+        for shell in shells {
+            if pane_ids.contains_key(&shell.id) {
+                continue;
+            }
+            let pane_id = self.insert_pane();
+            if let Some(pane) = self.terminals.get_mut(&pane_id) {
+                pane.shell = Some(shell.clone());
+            }
+            pane_ids.insert(shell.id.clone(), pane_id);
+            pending.push((pane_id, shell));
+        }
+
+        let preferred_pane = preferred_shell_id
+            .and_then(|shell_id| pane_ids.get(shell_id).copied())
+            .or_else(|| pane_ids.values().copied().min());
+        if let Some(pane_id) = preferred_pane {
+            self.focused = pane_id;
+            if let Some(terminal) = self
+                .terminals
+                .get(&pane_id)
+                .and_then(|pane| pane.session.as_ref())
+            {
+                terminal.focus();
+            }
+        }
+        self.navigation_region = NavigationRegion::Terminal;
+        self.sidebar_focus_pointer = None;
+        window.focus(&self.focus_handle, cx);
+
+        for (pane_id, shell) in pending {
+            let size = self.terminal_grid_size(pane_id, window);
+            self.start_terminal_attachment(pane_id, shell, size, cx);
+        }
+        cx.notify();
+    }
+
     fn activate_sidebar_shell(
         &mut self,
         shell_id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some((pane_id, terminal)) = self.terminals.iter().find_map(|(pane_id, pane)| {
-            pane.session
+        if let Some(pane_id) = self.terminals.iter().find_map(|(pane_id, pane)| {
+            pane.shell
                 .as_ref()
-                .filter(|terminal| terminal.shell_id == shell_id)
-                .map(|terminal| (*pane_id, terminal))
+                .filter(|shell| shell.id == shell_id)
+                .map(|_| *pane_id)
         }) {
             self.navigation_region = NavigationRegion::Terminal;
             self.focused = pane_id;
-            terminal.focus();
+            self.raise_floating_pane(pane_id);
+            if let Some(terminal) = self
+                .terminals
+                .get(&pane_id)
+                .and_then(|pane| pane.session.as_ref())
+            {
+                terminal.focus();
+            }
             window.focus(&self.focus_handle, cx);
             cx.notify();
             return;
@@ -2265,11 +3791,48 @@ impl Workspace {
             cx.notify();
             return;
         };
+        self.minimized_shells.remove(&shell.id);
+        let open_workspace_ids = self
+            .terminals
+            .values()
+            .filter_map(|pane| pane.shell.as_ref().map(|shell| shell.workspace_id.clone()))
+            .collect::<HashSet<_>>();
+        if shell_open_replaces_panes(
+            self.workspace_pane_mode,
+            &open_workspace_ids,
+            &shell.workspace_id,
+        ) {
+            self.detach_all_panes(window);
+        }
         self.navigation_region = NavigationRegion::Terminal;
         self.fullscreen = None;
         self.layout_animation = None;
+        let mut previous_rects = self
+            .layout
+            .as_ref()
+            .map(|layout| layout.rects().into_iter().collect::<HashMap<_, _>>())
+            .unwrap_or_default();
         let pane_id = self.insert_pane();
         self.focused = pane_id;
+        if self.motion_speed.duration().is_some()
+            && let Some(target) = self.layout.as_ref().and_then(|layout| {
+                layout
+                    .rects()
+                    .into_iter()
+                    .find_map(|(id, rect)| (id == pane_id).then_some(rect))
+            })
+        {
+            previous_rects.insert(
+                pane_id,
+                Rect {
+                    x: target.x + target.width / 2.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                },
+            );
+            self.begin_layout_animation(previous_rects);
+        }
         let size = self.terminal_grid_size(pane_id, window);
         self.start_terminal_attachment(pane_id, shell, size, cx);
     }
@@ -2311,9 +3874,9 @@ impl Workspace {
     }
 
     fn terminal_grid_size(&self, id: usize, window: &Window) -> (u16, u16, u16, u16) {
-        let viewport = window.viewport_size();
         let (width, height) = if self.fullscreen == Some(id) {
-            (f32::from(viewport.width), f32::from(viewport.height))
+            let pane = workspace_maximized_pane(id, self.panel_size(window), self.pane_gap);
+            (pane.width, pane.height)
         } else if let Some(pane) = self.floating.iter().find(|pane| pane.id == id) {
             (pane.width, pane.height)
         } else if let Some((_, rect)) = self.layout.as_ref().and_then(|layout| {
@@ -2322,15 +3885,24 @@ impl Workspace {
                 .into_iter()
                 .find(|(pane_id, _)| *pane_id == id)
         }) {
-            let (panel_width, panel_height) = Self::panel_size(window);
-            let inner_width = (panel_width - PANEL_PADDING * 2.0).max(1.0);
-            let inner_height = (panel_height - PANEL_PADDING * 2.0).max(1.0);
-            (rect.width * inner_width, rect.height * inner_height)
+            let (panel_width, panel_height) = self.panel_size(window);
+            let (inner_width, inner_height) =
+                inset_panel_size((panel_width, panel_height), self.pane_gap);
+            (
+                (rect.width * inner_width - self.pane_gap).max(1.0),
+                (rect.height * inner_height - self.pane_gap).max(1.0),
+            )
         } else {
             (640.0, 400.0)
         };
         let content_width = (width - TERMINAL_PADDING).max(TERMINAL_CELL_WIDTH * 2.0);
-        let content_height = (height - 38.0 - TERMINAL_PADDING).max(TERMINAL_CELL_HEIGHT * 2.0);
+        let heading_height = if self.pane_headings_visible {
+            38.0
+        } else {
+            0.0
+        };
+        let content_height =
+            (height - heading_height - TERMINAL_PADDING).max(TERMINAL_CELL_HEIGHT * 2.0);
         let cols = (content_width / TERMINAL_CELL_WIDTH)
             .floor()
             .clamp(2.0, f32::from(u16::MAX)) as u16;
@@ -2384,18 +3956,123 @@ impl Workspace {
         }
     }
 
+    fn sidebar_header_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        self.sidebar_header_menu_open.then(|| {
+            div()
+                .id("sidebar-header-menu")
+                .absolute()
+                .occlude()
+                .top(px(54.0))
+                .right(px(10.0))
+                .w(px(228.0))
+                .p_1()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(0x45475a))
+                .bg(rgb(0x1e1e2e))
+                .shadow_lg()
+                .child(
+                    div()
+                        .id("header-menu-settings")
+                        .h(px(36.0))
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|row| row.bg(rgb(0x313244)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.sidebar_header_menu_open = false;
+                            this.toggle_settings(cx);
+                        }))
+                        .child(div().min_w_0().flex_1().child("Settings"))
+                        .child(div().flex_none().text_color(rgb(0x7f849c)).child("⚙")),
+                )
+                .child(
+                    div()
+                        .id("header-menu-help")
+                        .h(px(36.0))
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|row| row.bg(rgb(0x313244)))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.sidebar_header_menu_open = false;
+                            this.toggle_help(&ToggleHelp, window, cx);
+                        }))
+                        .child(div().min_w_0().flex_1().child("Keyboard shortcuts"))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .text_color(rgb(0x7f849c))
+                                .child("F1"),
+                        ),
+                )
+                .child(div().mx_2().my_1().h(px(1.0)).bg(rgb(0x313244)))
+                .child(
+                    div()
+                        .id("header-menu-hide-sidebar")
+                        .h(px(36.0))
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|row| row.bg(rgb(0x313244)))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.sidebar_header_menu_open = false;
+                            this.toggle_sidebar_drawer(&ToggleSidebarDrawer, window, cx);
+                        }))
+                        .child(div().min_w_0().flex_1().child("Hide sidebar"))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .text_color(rgb(0x7f849c))
+                                .child("Ctrl+B"),
+                        ),
+                )
+                .into_any_element()
+        })
+    }
+
     fn sidebar(&self, cx: &mut Context<Self>) -> Div {
+        let header_menu = self.sidebar_header_menu(cx);
+        let settings_panel = self.settings_overlay(cx);
         let focused_shell_id = self
             .terminals
             .get(&self.focused)
-            .and_then(|pane| pane.session.as_ref())
-            .map(|terminal| terminal.shell_id.as_str());
+            .and_then(|pane| pane.shell.as_ref())
+            .map(|shell| shell.id.as_str());
+        let open_shell_ids = self
+            .terminals
+            .values()
+            .filter_map(|pane| pane.shell.as_ref().map(|shell| shell.id.as_str()))
+            .collect::<HashSet<_>>();
         let focused_workspace_id = self
             .terminals
             .get(&self.focused)
             .and_then(|pane| pane.shell.as_ref())
             .map(|shell| shell.workspace_id.as_str());
-
+        let workspace_offsets = sidebar_workspace_offsets(
+            &self.boomux_overview,
+            &self.expanded_workspaces,
+            self.pane_layout_mode,
+        );
+        let workspace_order_animation = self.workspace_order_animation.clone();
+        let workspace_order_animation_duration = self.motion_speed.duration();
         let workspace_rows = self
             .boomux_overview
             .workspaces
@@ -2403,6 +4080,7 @@ impl Workspace {
             .cloned()
             .map(|workspace| {
                 let workspace_id = workspace.id.clone();
+                let workspace_name = workspace.name.clone();
                 let workspace_item = SidebarItem::Workspace(workspace.id.clone());
                 let workspace_keyboard_selected = self.navigation_region
                     == NavigationRegion::Sidebar
@@ -2410,114 +4088,118 @@ impl Workspace {
                 let expanded = self.expanded_workspaces.contains(&workspace.id);
                 let active = focused_workspace_id == Some(workspace.id.as_str());
                 let shell_count = workspace.shells.len();
-                let shell_rows = workspace
-                    .shells
-                    .into_iter()
-                    .map(|shell| {
-                        let shell_id = shell.id.clone();
-                        let shell_target = SidebarResource::Shell {
-                            id: shell.id.clone(),
-                            workspace_id: workspace.id.clone(),
-                            name: shell.name.clone(),
-                        };
-                        let shell_item = SidebarItem::Shell {
-                            workspace_id: workspace.id.clone(),
-                            shell_id: shell.id.clone(),
-                        };
-                        let keyboard_selected = self.navigation_region == NavigationRegion::Sidebar
-                            && self.sidebar_item.as_ref() == Some(&shell_item);
-                        let selected = focused_shell_id == Some(shell.id.as_str());
-                        let status = shell.status_label();
-                        div()
-                            .id(SharedString::from(format!("sidebar-shell-{}", shell.id)))
-                            .ml_6()
-                            .h(px(39.0))
-                            .px_2()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .rounded_md()
-                            .anchor_scroll(
-                                keyboard_selected.then(|| self.sidebar_scroll_anchor.clone()),
-                            )
-                            .bg(if keyboard_selected {
-                                rgb(0x45475a)
-                            } else if selected {
-                                rgb(0x252536)
-                            } else {
-                                rgb(0x181825)
-                            })
-                            .hover(|element| element.bg(rgb(0x29293d)))
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.activate_sidebar_shell(&shell_id, window, cx);
-                            }))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(if status == "running" {
-                                        0x89b4fa
-                                    } else {
-                                        0x6c7086
-                                    }))
-                                    .child("○"),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .flex()
-                                    .flex_col()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .text_color(rgb(0xcdd6f4))
-                                            .child(shell.name),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(0x6c7086))
-                                            .child(format!("shell · {status}")),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!(
-                                        "sidebar-shell-menu-{}",
-                                        shell.id
-                                    )))
-                                    .w(px(24.0))
-                                    .h(px(28.0))
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_md()
-                                    .text_color(rgb(0x7f849c))
-                                    .hover(|element| {
-                                        element.bg(rgb(0x45475a)).text_color(rgb(0xcdd6f4))
-                                    })
-                                    .on_click(cx.listener(move |this, event, window, cx| {
-                                        this.open_sidebar_menu(
-                                            shell_target.clone(),
-                                            event,
-                                            window,
-                                            cx,
-                                        );
-                                    }))
-                                    .child("⋮"),
-                            )
-                    })
-                    .collect::<Vec<_>>();
+                let shell_rows =
+                    workspace
+                        .shells
+                        .clone()
+                        .into_iter()
+                        .filter(|_| self.pane_layout_mode != PaneLayoutMode::Tabbed)
+                        .map(|shell| {
+                            let shell_id = shell.id.clone();
+                            let shell_target = SidebarResource::Shell {
+                                id: shell.id.clone(),
+                                workspace_id: workspace.id.clone(),
+                                name: shell.name.clone(),
+                            };
+                            let shell_item = SidebarItem::Shell {
+                                workspace_id: workspace.id.clone(),
+                                shell_id: shell.id.clone(),
+                            };
+                            let keyboard_selected = self.navigation_region
+                                == NavigationRegion::Sidebar
+                                && self.sidebar_item.as_ref() == Some(&shell_item);
+                            let selected = focused_shell_id == Some(shell.id.as_str());
+                            let pane_open = open_shell_ids.contains(shell.id.as_str());
+                            let pane_presence = shell_pane_presence(selected, pane_open);
+                            let status = shell.status_label();
+                            div()
+                                .id(SharedString::from(format!("sidebar-shell-{}", shell.id)))
+                                .ml_6()
+                                .h(px(39.0))
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .rounded_md()
+                                .anchor_scroll(
+                                    keyboard_selected.then(|| self.sidebar_scroll_anchor.clone()),
+                                )
+                                .bg(if keyboard_selected {
+                                    rgb(0x45475a)
+                                } else if selected {
+                                    rgb(0x252536)
+                                } else {
+                                    rgb(0x181825)
+                                })
+                                .hover(|element| element.bg(rgb(0x29293d)))
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.activate_sidebar_shell(&shell_id, window, cx);
+                                }))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(
+                                            if pane_presence != ShellPanePresence::Minimized {
+                                                0x89b4fa
+                                            } else {
+                                                0x6c7086
+                                            },
+                                        ))
+                                        .child(pane_presence.glyph()),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .flex()
+                                        .flex_col()
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                .text_color(rgb(0xcdd6f4))
+                                                .child(shell.name),
+                                        )
+                                        .child(div().text_xs().text_color(rgb(0x6c7086)).child(
+                                            format!("{} · {status}", pane_presence.label()),
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "sidebar-shell-menu-{}",
+                                            shell.id
+                                        )))
+                                        .w(px(24.0))
+                                        .h(px(28.0))
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .text_color(rgb(0x7f849c))
+                                        .hover(|element| {
+                                            element.bg(rgb(0x45475a)).text_color(rgb(0xcdd6f4))
+                                        })
+                                        .on_click(cx.listener(move |this, event, window, cx| {
+                                            this.open_sidebar_menu(
+                                                shell_target.clone(),
+                                                event,
+                                                window,
+                                                cx,
+                                            );
+                                        }))
+                                        .child("⋮"),
+                                )
+                        })
+                        .collect::<Vec<_>>();
 
                 let workspace_target = SidebarResource::Workspace {
                     id: workspace.id.clone(),
                     name: workspace.name.clone(),
                 };
-
-                div()
+                let row = div()
                     .id(SharedString::from(format!(
                         "sidebar-workspace-{}",
                         workspace.id
@@ -2551,18 +4233,37 @@ impl Workspace {
                             })
                             .hover(|element| element.bg(rgb(0x29293d)))
                             .cursor_pointer()
+                            .on_drag(
+                                WorkspaceRowDrag {
+                                    workspace_id: workspace.id.clone(),
+                                    workspace_name,
+                                },
+                                |drag, _, _, cx| cx.new(|_| drag.clone()),
+                            )
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.navigation_region = NavigationRegion::Sidebar;
                                 this.sidebar_item = Some(workspace_item.clone());
                                 window.focus(&this.focus_handle, cx);
-                                this.toggle_workspace(&workspace_id, cx);
+                                if this.workspace_pane_mode == WorkspacePaneMode::Workspace
+                                    || this.pane_layout_mode == PaneLayoutMode::Tabbed
+                                {
+                                    this.open_workspace(&workspace_id, None, window, cx);
+                                } else {
+                                    this.toggle_workspace(&workspace_id, cx);
+                                }
                             }))
                             .child(
                                 div()
                                     .w(px(14.0))
                                     .text_xs()
                                     .text_color(if active { rgb(0x89b4fa) } else { rgb(0x6c7086) })
-                                    .child(if expanded { "▾" } else { "▸" }),
+                                    .child(if self.pane_layout_mode == PaneLayoutMode::Tabbed {
+                                        ""
+                                    } else if expanded {
+                                        "▾"
+                                    } else {
+                                        "▸"
+                                    }),
                             )
                             .child(div().size_2().rounded_full().bg(if active {
                                 rgb(0x89b4fa)
@@ -2626,7 +4327,37 @@ impl Workspace {
                                     .child("⋮"),
                             ),
                     )
-                    .when(expanded, |element| element.children(shell_rows))
+                    .when(expanded, |element| element.children(shell_rows));
+
+                if let (Some(animation), Some(duration)) = (
+                    workspace_order_animation.as_ref(),
+                    workspace_order_animation_duration,
+                ) {
+                    let target_y = workspace_offsets
+                        .get(&workspace.id)
+                        .copied()
+                        .unwrap_or_default();
+                    let from_y = animation
+                        .from
+                        .get(&workspace.id)
+                        .copied()
+                        .unwrap_or(target_y);
+                    let offset = from_y - target_y;
+                    let animation_id = SharedString::from(format!(
+                        "workspace-order-{}-{}",
+                        animation.generation, workspace.id
+                    ));
+                    row.with_animation(
+                        animation_id,
+                        Animation::new(duration).with_easing(ease_out_quint()),
+                        move |element, progress| {
+                            element.relative().top(px(offset * (1.0 - progress)))
+                        },
+                    )
+                    .into_any_element()
+                } else {
+                    row.into_any_element()
+                }
             })
             .collect::<Vec<_>>();
 
@@ -2639,6 +4370,7 @@ impl Workspace {
             .collect::<Vec<_>>();
 
         div()
+            .relative()
             .w(px(SIDEBAR_WIDTH))
             .h_full()
             .flex_none()
@@ -2694,22 +4426,55 @@ impl Workspace {
                     )
                     .child(
                         div()
-                            .id("create-workspace")
-                            .size(px(30.0))
                             .flex()
                             .items_center()
-                            .justify_center()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(rgb(0x45475a))
-                            .cursor_pointer()
-                            .text_color(rgb(0xa6adc8))
-                            .hover(|button| button.bg(rgb(0x313244)))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.create_and_attach_new_workspace(window, cx);
-                            }))
-                            .child("+"),
+                            .gap_1()
+                            .child(
+                                div()
+                                    .id("create-workspace")
+                                    .size(px(28.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(rgb(0x45475a))
+                                    .cursor_pointer()
+                                    .text_color(rgb(0xa6adc8))
+                                    .hover(|button| button.bg(rgb(0x313244)))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.sidebar_header_menu_open = false;
+                                        this.create_and_attach_new_workspace(window, cx);
+                                    }))
+                                    .child("+"),
+                            )
+                            .child(
+                                div()
+                                    .id("open-sidebar-menu")
+                                    .size(px(28.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(rgb(if self.sidebar_header_menu_open {
+                                        0xcba6f7
+                                    } else {
+                                        0x45475a
+                                    }))
+                                    .cursor_pointer()
+                                    .text_color(rgb(0xa6adc8))
+                                    .hover(|button| button.bg(rgb(0x313244)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.sidebar_header_menu_open =
+                                            !this.sidebar_header_menu_open;
+                                        this.sidebar_menu = None;
+                                        cx.notify();
+                                    }))
+                                    .child("⋯"),
+                            ),
                     ),
             )
             .child(
@@ -2737,7 +4502,13 @@ impl Workspace {
                                 .child("No Boomux workspaces"),
                         )
                     })
-                    .children(workspace_rows)
+                    .child(
+                        div()
+                            .id("sidebar-workspace-list")
+                            .w_full()
+                            .on_drag_move(cx.listener(Self::drag_workspace))
+                            .children(workspace_rows),
+                    )
                     .child(div().mt_4().mb_3().h(px(1.0)).w_full().bg(rgb(0x313244)))
                     .child(
                         div()
@@ -2758,11 +4529,17 @@ impl Workspace {
                     })
                     .children(agent_rows),
             )
+            .when_some(settings_panel, |element, settings| element.child(settings))
+            .when_some(header_menu, |element, menu| element.child(menu))
     }
 
     fn sidebar_menu_overlay(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let menu = self.sidebar_menu.as_ref()?;
         let target = menu.target.clone();
+        let open_workspace_id = match &target {
+            SidebarResource::Workspace { id, .. } => Some(id.clone()),
+            SidebarResource::Shell { .. } => None,
+        };
         let create_workspace_id = match &target {
             SidebarResource::Workspace { id, .. } => Some(id.clone()),
             SidebarResource::Shell { .. } => None,
@@ -2784,6 +4561,24 @@ impl Workspace {
                 .border_color(rgb(0x45475a))
                 .bg(rgb(0x1e1e2e))
                 .shadow_lg()
+                .when_some(open_workspace_id, |element, workspace_id| {
+                    element.child(
+                        div()
+                            .id("sidebar-menu-open-workspace")
+                            .h(px(34.0))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|row| row.bg(rgb(0x313244)))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.open_workspace(&workspace_id, None, window, cx);
+                            }))
+                            .child("Open workspace"),
+                    )
+                })
                 .when_some(create_workspace_id, |element, workspace_id| {
                     element.child(
                         div()
@@ -2839,18 +4634,799 @@ impl Workspace {
                         .text_color(rgb(0xf38ba8))
                         .cursor_pointer()
                         .hover(|row| row.bg(rgb(0x313244)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                        .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
-                            this.open_resource_dialog(
-                                ResourceDialogKind::Remove,
-                                remove_target.clone(),
-                            );
-                            cx.notify();
+                            this.request_remove_resource(remove_target.clone(), window, cx);
                         }))
                         .child("Remove"),
                 )
                 .into_any_element(),
         )
+    }
+
+    fn settings_overlay(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        self.settings_open.then(|| {
+            div()
+                .id("appearance-settings")
+                .absolute()
+                .occlude()
+                .left_0()
+                .top(px(64.0))
+                .bottom_0()
+                .w(px(SIDEBAR_WIDTH))
+                .min_h_0()
+                .overflow_y_scroll()
+                .p_4()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .bg(rgb(0x181825))
+                .child(
+                    div()
+                        .h(px(44.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .text_base()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .child("Settings"),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x6c7086))
+                                        .child("Changes apply immediately"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("close-settings")
+                                .size(px(28.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(0x45475a))
+                                .text_color(rgb(0xa6adc8))
+                                .cursor_pointer()
+                                .hover(|button| button.bg(rgb(0x313244)))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.settings_open = false;
+                                    cx.notify();
+                                }))
+                                .child("×"),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x7f849c))
+                                .child("Pane layout"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("pane-layout-tiled")
+                                        .h(px(34.0))
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(
+                                            if self.pane_layout_mode == PaneLayoutMode::Tiled {
+                                                0xcba6f7
+                                            } else {
+                                                0x45475a
+                                            },
+                                        ))
+                                        .bg(rgb(
+                                            if self.pane_layout_mode == PaneLayoutMode::Tiled {
+                                                0x313244
+                                            } else {
+                                                0x181825
+                                            },
+                                        ))
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.set_pane_layout_mode(
+                                                PaneLayoutMode::Tiled,
+                                                window,
+                                                cx,
+                                            );
+                                        }))
+                                        .child("Tiled"),
+                                )
+                                .child(
+                                    div()
+                                        .id("pane-layout-tabbed")
+                                        .h(px(34.0))
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(
+                                            if self.pane_layout_mode == PaneLayoutMode::Tabbed {
+                                                0xcba6f7
+                                            } else {
+                                                0x45475a
+                                            },
+                                        ))
+                                        .bg(rgb(
+                                            if self.pane_layout_mode == PaneLayoutMode::Tabbed {
+                                                0x313244
+                                            } else {
+                                                0x181825
+                                            },
+                                        ))
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.set_pane_layout_mode(
+                                                PaneLayoutMode::Tabbed,
+                                                window,
+                                                cx,
+                                            );
+                                        }))
+                                        .child("Tabs"),
+                                ),
+                        )
+                        .child(div().text_xs().text_color(rgb(0x6c7086)).child(
+                            if self.pane_layout_mode == PaneLayoutMode::Tiled {
+                                "Show every open pane in the tiled and floating canvas."
+                            } else {
+                                "Keep windows tiled; minimized Shells become tabs at the top."
+                            },
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x7f849c))
+                                .child("Pane scope"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("pane-scope-workspace")
+                                        .h(px(34.0))
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(
+                                            if self.workspace_pane_mode
+                                                == WorkspacePaneMode::Workspace
+                                            {
+                                                0xcba6f7
+                                            } else {
+                                                0x45475a
+                                            },
+                                        ))
+                                        .bg(rgb(
+                                            if self.workspace_pane_mode
+                                                == WorkspacePaneMode::Workspace
+                                            {
+                                                0x313244
+                                            } else {
+                                                0x181825
+                                            },
+                                        ))
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.workspace_pane_mode = WorkspacePaneMode::Workspace;
+                                            let workspace_id = this
+                                                .terminals
+                                                .get(&this.focused)
+                                                .and_then(|pane| pane.shell.as_ref())
+                                                .map(|shell| shell.workspace_id.clone());
+                                            if let Some(workspace_id) = workspace_id {
+                                                this.open_workspace(
+                                                    &workspace_id,
+                                                    None,
+                                                    window,
+                                                    cx,
+                                                );
+                                            } else {
+                                                cx.notify();
+                                            }
+                                        }))
+                                        .child("Workspace"),
+                                )
+                                .child(
+                                    div()
+                                        .id("pane-scope-mixed")
+                                        .h(px(34.0))
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(
+                                            if self.workspace_pane_mode == WorkspacePaneMode::Mixed
+                                            {
+                                                0xcba6f7
+                                            } else {
+                                                0x45475a
+                                            },
+                                        ))
+                                        .bg(rgb(
+                                            if self.workspace_pane_mode == WorkspacePaneMode::Mixed
+                                            {
+                                                0x313244
+                                            } else {
+                                                0x181825
+                                            },
+                                        ))
+                                        .when(
+                                            pane_layout_supports_scope(
+                                                self.pane_layout_mode,
+                                                WorkspacePaneMode::Mixed,
+                                            ),
+                                            |button| button.cursor_pointer(),
+                                        )
+                                        .text_color(rgb(
+                                            if self.pane_layout_mode == PaneLayoutMode::Tabbed {
+                                                0x6c7086
+                                            } else {
+                                                0xcdd6f4
+                                            },
+                                        ))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if pane_layout_supports_scope(
+                                                this.pane_layout_mode,
+                                                WorkspacePaneMode::Mixed,
+                                            ) {
+                                                this.workspace_pane_mode = WorkspacePaneMode::Mixed;
+                                                cx.notify();
+                                            }
+                                        }))
+                                        .child("Mixed"),
+                                ),
+                        )
+                        .child(div().text_xs().text_color(rgb(0x6c7086)).child(
+                            if self.pane_layout_mode == PaneLayoutMode::Tabbed {
+                                "Tabs is Workspace-only; Mixed is unavailable in this layout."
+                            } else if self.workspace_pane_mode == WorkspacePaneMode::Workspace {
+                                "Opening a Workspace replaces the canvas with all of its Shells."
+                            } else {
+                                "Shells from different Workspaces can share the canvas."
+                            },
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x7f849c))
+                                .child("Window headings"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("pane-headings-on")
+                                        .h(px(34.0))
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(if self.pane_headings_visible {
+                                            0xcba6f7
+                                        } else {
+                                            0x45475a
+                                        }))
+                                        .bg(rgb(if self.pane_headings_visible {
+                                            0x313244
+                                        } else {
+                                            0x181825
+                                        }))
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.pane_headings_visible = true;
+                                            cx.notify();
+                                        }))
+                                        .child("On"),
+                                )
+                                .child(
+                                    div()
+                                        .id("pane-headings-off")
+                                        .h(px(34.0))
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(if !self.pane_headings_visible {
+                                            0xcba6f7
+                                        } else {
+                                            0x45475a
+                                        }))
+                                        .bg(rgb(if !self.pane_headings_visible {
+                                            0x313244
+                                        } else {
+                                            0x181825
+                                        }))
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.pane_headings_visible = false;
+                                            cx.notify();
+                                        }))
+                                        .child("Off"),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x7f849c))
+                                .child("Window edges"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("pane-edges-rounded")
+                                        .h(px(34.0))
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(
+                                            if self.pane_corner_style == PaneCornerStyle::Rounded {
+                                                0xcba6f7
+                                            } else {
+                                                0x45475a
+                                            },
+                                        ))
+                                        .bg(rgb(
+                                            if self.pane_corner_style == PaneCornerStyle::Rounded {
+                                                0x313244
+                                            } else {
+                                                0x181825
+                                            },
+                                        ))
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.pane_corner_style = PaneCornerStyle::Rounded;
+                                            cx.notify();
+                                        }))
+                                        .child("Rounded"),
+                                )
+                                .child(
+                                    div()
+                                        .id("pane-edges-square")
+                                        .h(px(34.0))
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(
+                                            if self.pane_corner_style == PaneCornerStyle::Square {
+                                                0xcba6f7
+                                            } else {
+                                                0x45475a
+                                            },
+                                        ))
+                                        .bg(rgb(
+                                            if self.pane_corner_style == PaneCornerStyle::Square {
+                                                0x313244
+                                            } else {
+                                                0x181825
+                                            },
+                                        ))
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.pane_corner_style = PaneCornerStyle::Square;
+                                            cx.notify();
+                                        }))
+                                        .child("Square"),
+                                )
+                                .child(
+                                    div()
+                                        .id("pane-edges-mixed")
+                                        .h(px(34.0))
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(
+                                            if self.pane_corner_style == PaneCornerStyle::Mixed {
+                                                0xcba6f7
+                                            } else {
+                                                0x45475a
+                                            },
+                                        ))
+                                        .bg(rgb(
+                                            if self.pane_corner_style == PaneCornerStyle::Mixed {
+                                                0x313244
+                                            } else {
+                                                0x181825
+                                            },
+                                        ))
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.pane_corner_style = PaneCornerStyle::Mixed;
+                                            cx.notify();
+                                        }))
+                                        .child("Mixed"),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x7f849c))
+                                .child("Window spacing"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("decrease-pane-gap")
+                                        .w(px(44.0))
+                                        .h(px(34.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(0x45475a))
+                                        .cursor_pointer()
+                                        .hover(|button| button.bg(rgb(0x313244)))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.pane_gap = (this.pane_gap - 2.0).max(0.0);
+                                            cx.notify();
+                                        }))
+                                        .child("−"),
+                                )
+                                .child(
+                                    div()
+                                        .h(px(34.0))
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(0x45475a))
+                                        .bg(rgb(0x1e1e2e))
+                                        .text_sm()
+                                        .text_color(rgb(0xa6adc8))
+                                        .child(format!("{:.0}px", self.pane_gap)),
+                                )
+                                .child(
+                                    div()
+                                        .id("increase-pane-gap")
+                                        .w(px(44.0))
+                                        .h(px(34.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(0x45475a))
+                                        .cursor_pointer()
+                                        .hover(|button| button.bg(rgb(0x313244)))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.pane_gap = (this.pane_gap + 2.0).min(32.0);
+                                            cx.notify();
+                                        }))
+                                        .child("+"),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x7f849c))
+                                .child("Window motion"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("motion-instant")
+                                        .h(px(34.0))
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(
+                                            if self.motion_speed == MotionSpeed::Instant {
+                                                0xcba6f7
+                                            } else {
+                                                0x45475a
+                                            },
+                                        ))
+                                        .bg(rgb(if self.motion_speed == MotionSpeed::Instant {
+                                            0x313244
+                                        } else {
+                                            0x181825
+                                        }))
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.motion_speed = MotionSpeed::Instant;
+                                            this.layout_animation = None;
+                                            this.floating_animation = None;
+                                            cx.notify();
+                                        }))
+                                        .child("Instant"),
+                                )
+                                .child(
+                                    div()
+                                        .id("motion-fast")
+                                        .h(px(34.0))
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(
+                                            if self.motion_speed == MotionSpeed::Fast {
+                                                0xcba6f7
+                                            } else {
+                                                0x45475a
+                                            },
+                                        ))
+                                        .bg(rgb(if self.motion_speed == MotionSpeed::Fast {
+                                            0x313244
+                                        } else {
+                                            0x181825
+                                        }))
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.motion_speed = MotionSpeed::Fast;
+                                            cx.notify();
+                                        }))
+                                        .child("Fast"),
+                                )
+                                .child(
+                                    div()
+                                        .id("motion-smooth")
+                                        .h(px(34.0))
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(
+                                            if self.motion_speed == MotionSpeed::Smooth {
+                                                0xcba6f7
+                                            } else {
+                                                0x45475a
+                                            },
+                                        ))
+                                        .bg(rgb(if self.motion_speed == MotionSpeed::Smooth {
+                                            0x313244
+                                        } else {
+                                            0x181825
+                                        }))
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.motion_speed = MotionSpeed::Smooth;
+                                            cx.notify();
+                                        }))
+                                        .child("Smooth"),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x7f849c))
+                                .child("Focus highlight"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("decrease-focus-highlight")
+                                        .w(px(44.0))
+                                        .h(px(34.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(0x45475a))
+                                        .cursor_pointer()
+                                        .hover(|button| button.bg(rgb(0x313244)))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.focus_highlight_strength =
+                                                this.focus_highlight_strength.saturating_sub(10);
+                                            cx.notify();
+                                        }))
+                                        .child("−"),
+                                )
+                                .child(
+                                    div()
+                                        .h(px(34.0))
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(0x45475a))
+                                        .bg(rgb(0x1e1e2e))
+                                        .text_sm()
+                                        .text_color(rgb(0xa6adc8))
+                                        .child(format!("{}%", self.focus_highlight_strength)),
+                                )
+                                .child(
+                                    div()
+                                        .id("increase-focus-highlight")
+                                        .w(px(44.0))
+                                        .h(px(34.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(0x45475a))
+                                        .cursor_pointer()
+                                        .hover(|button| button.bg(rgb(0x313244)))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.focus_highlight_strength = this
+                                                .focus_highlight_strength
+                                                .saturating_add(10)
+                                                .min(100);
+                                            cx.notify();
+                                        }))
+                                        .child("+"),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x7f849c))
+                                .child("Confirm removals"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("removal-confirmation-on")
+                                        .h(px(34.0))
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(if self.confirm_destructive_actions {
+                                            0xcba6f7
+                                        } else {
+                                            0x45475a
+                                        }))
+                                        .bg(rgb(if self.confirm_destructive_actions {
+                                            0x313244
+                                        } else {
+                                            0x181825
+                                        }))
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.confirm_destructive_actions = true;
+                                            cx.notify();
+                                        }))
+                                        .child("On"),
+                                )
+                                .child(
+                                    div()
+                                        .id("removal-confirmation-off")
+                                        .h(px(34.0))
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(if !self.confirm_destructive_actions {
+                                            0xcba6f7
+                                        } else {
+                                            0x45475a
+                                        }))
+                                        .bg(rgb(if !self.confirm_destructive_actions {
+                                            0x313244
+                                        } else {
+                                            0x181825
+                                        }))
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.confirm_destructive_actions = false;
+                                            cx.notify();
+                                        }))
+                                        .child("Off"),
+                                ),
+                        ),
+                )
+                .into_any_element()
+        })
     }
 
     fn resource_dialog_overlay(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
@@ -3280,21 +5856,18 @@ impl Workspace {
                 (screen.scroll_offset as f32 / maximum as f32).clamp(0.0, 1.0)
             };
             let thumb_top = progress * (1.0 - thumb_fraction);
-            let scrollbar = div()
-                .id(("terminal-scrollbar", pane_id))
+            let scrollbar_hovered = pane.is_some_and(|pane| pane.scrollbar_hovered);
+            let scrollbar_dragging = self
+                .terminal_scrollbar_drag
+                .as_ref()
+                .is_some_and(|drag| drag.pane_id == pane_id);
+            let scrollbar_visible = scrollbar_hovered || scrollbar_dragging;
+            let fade_generation = pane.map_or(0, |pane| pane.scrollbar_fade_generation);
+            let scrollbar_visual = div()
                 .absolute()
-                .right(px(1.0))
-                .top(px(2.0))
-                .bottom(px(2.0))
-                .w(px(10.0))
+                .size_full()
                 .rounded_full()
                 .bg(rgb(0x1e1e2e))
-                .cursor_pointer()
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_drag(TerminalScrollbarDrag, move |_, _, _, cx| {
-                    cx.new(move |_| TerminalScrollbarDrag(pane_id))
-                })
-                .on_drag_move(cx.listener(Self::drag_terminal_scrollbar))
                 .child(
                     div()
                         .absolute()
@@ -3305,6 +5878,47 @@ impl Workspace {
                         .rounded_full()
                         .bg(rgb(if maximum == 0 { 0x313244 } else { 0x6c7086 })),
                 );
+            let scrollbar_visual = if fade_generation == 0 {
+                scrollbar_visual
+                    .opacity(if scrollbar_visible { 1.0 } else { 0.0 })
+                    .into_any_element()
+            } else {
+                let animation_id = SharedString::from(format!(
+                    "terminal-scrollbar-fade-{pane_id}-{fade_generation}"
+                ));
+                let duration = if scrollbar_visible {
+                    SCROLLBAR_FADE_IN_DURATION
+                } else {
+                    SCROLLBAR_FADE_OUT_DURATION
+                };
+                scrollbar_visual
+                    .with_animation(
+                        animation_id,
+                        Animation::new(duration),
+                        move |element, progress| {
+                            element.opacity(scrollbar_fade_opacity(scrollbar_visible, progress))
+                        },
+                    )
+                    .into_any_element()
+            };
+            let scrollbar = div()
+                .id(("terminal-scrollbar", pane_id))
+                .absolute()
+                .right(px(1.0))
+                .top(px(2.0))
+                .bottom(px(2.0))
+                .w(px(10.0))
+                .cursor(CursorStyle::Arrow)
+                .on_hover(cx.listener(move |this, hovered, _, cx| {
+                    this.set_terminal_scrollbar_hover(pane_id, *hovered, cx);
+                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event, window, cx| {
+                        this.begin_terminal_scrollbar_drag(pane_id, event, window, cx);
+                    }),
+                )
+                .child(scrollbar_visual);
             return div()
                 .relative()
                 .size_full()
@@ -3351,6 +5965,15 @@ impl Workspace {
     }
 
     fn pane(&self, id: usize, cx: &mut Context<Self>) -> Stateful<Div> {
+        self.pane_with_heading(id, self.pane_headings_visible, cx)
+    }
+
+    fn pane_with_heading(
+        &self,
+        id: usize,
+        show_heading: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         let focused = self.focused == id;
         let pane = self.terminals.get(&id);
         let title: SharedString = pane.and_then(|pane| pane.session.as_ref()).map_or_else(
@@ -3358,6 +5981,12 @@ impl Workspace {
             |terminal| terminal.shell_name.clone().into(),
         );
         let accent = rgb(0xa6e3a1);
+        let corners = pane_corner_radii(id, self.pane_corner_style);
+        let focused_border = blend_rgb(0x313244, 0xcba6f7, self.focus_highlight_strength);
+        let focused_heading = blend_rgb(0x1e1e2e, 0x313244, self.focus_highlight_strength);
+        let status_message = pane
+            .and_then(|pane| pane.session.as_ref())
+            .and_then(TerminalSession::status_message);
 
         div()
             .id(("pane", id))
@@ -3365,10 +5994,13 @@ impl Workspace {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .rounded_lg()
+            .rounded_tl(px(corners[0]))
+            .rounded_tr(px(corners[1]))
+            .rounded_br(px(corners[2]))
+            .rounded_bl(px(corners[3]))
             .border_2()
             .border_color(if focused {
-                rgb(0xcba6f7)
+                rgb(focused_border)
             } else {
                 rgb(0x313244)
             })
@@ -3392,46 +6024,131 @@ impl Workspace {
                     this.begin_pointer_interaction(id, event, window, cx);
                 }),
             )
-            .child(
-                div()
-                    .h(px(38.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .px_3()
-                    .bg(if focused {
-                        rgb(0x313244)
-                    } else {
-                        rgb(0x1e1e2e)
-                    })
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(div().size_2().rounded_full().bg(accent))
-                            .child(title),
-                    )
-                    .child(div().text_xs().text_color(rgb(0x7f849c)).child(
-                        pane.and_then(|pane| pane.session.as_ref()).map_or_else(
-                            || "local shells".into(),
-                            |terminal| {
-                                pane.and_then(|pane| pane.screen.as_ref()).map_or_else(
-                                    || terminal.status(),
-                                    |screen| {
-                                        format!(
-                                            "{} · {}×{}",
-                                            terminal.status(),
-                                            screen.cols,
-                                            screen.rows
-                                        )
-                                    },
+            .when(show_heading, |element| {
+                element.child(
+                    div()
+                        .h(px(38.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .px_3()
+                        .bg(if focused {
+                            rgb(focused_heading)
+                        } else {
+                            rgb(0x1e1e2e)
+                        })
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(div().size_2().rounded_full().bg(accent))
+                                .child(div().min_w_0().overflow_hidden().child(title))
+                                .child(
+                                    div()
+                                        .id(("rename-pane", id))
+                                        .w(px(22.0))
+                                        .h(px(22.0))
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .text_xs()
+                                        .text_color(rgb(0x7f849c))
+                                        .cursor_pointer()
+                                        .hover(|button| {
+                                            button.bg(rgb(0x45475a)).text_color(rgb(0xcdd6f4))
+                                        })
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.request_pane_shell_dialog(
+                                                id,
+                                                ResourceDialogKind::Rename,
+                                                window,
+                                                cx,
+                                            );
+                                        }))
+                                        .child("✎"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .when_some(status_message, |controls, status| {
+                                    controls.child(
+                                        div()
+                                            .mr_1()
+                                            .text_xs()
+                                            .text_color(rgb(0xf9e2af))
+                                            .child(status),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .id(("minimize-pane", id))
+                                        .w(px(28.0))
+                                        .h(px(26.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(0x45475a))
+                                        .text_color(rgb(0xa6adc8))
+                                        .cursor_pointer()
+                                        .hover(|button| button.bg(rgb(0x45475a)))
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.minimize_pane(id, window, cx);
+                                        }))
+                                        .child("−"),
                                 )
-                            },
+                                .child(
+                                    div()
+                                        .id(("close-pane", id))
+                                        .w(px(28.0))
+                                        .h(px(26.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(0x45475a))
+                                        .text_color(rgb(0xa6adc8))
+                                        .cursor_pointer()
+                                        .hover(|button| {
+                                            button.bg(rgb(0x89384c)).text_color(rgb(0xf5e0e6))
+                                        })
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.request_pane_shell_dialog(
+                                                id,
+                                                ResourceDialogKind::Remove,
+                                                window,
+                                                cx,
+                                            );
+                                        }))
+                                        .child("×"),
+                                ),
                         ),
-                    )),
-            )
+                )
+            })
             .child(
                 div()
                     .id(("terminal-interaction", id))
@@ -3455,20 +6172,180 @@ impl Workspace {
             )
     }
 
+    fn minimized_tab_strip(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let shells = self.minimized_tab_shells();
+        if shells.is_empty() {
+            return None;
+        }
+        let tabs = shells
+            .into_iter()
+            .map(|shell| {
+                let shell_id = shell.id.clone();
+                let rename_target = SidebarResource::Shell {
+                    id: shell.id.clone(),
+                    workspace_id: shell.workspace_id.clone(),
+                    name: shell.name.clone(),
+                };
+                div()
+                    .id(SharedString::from(format!("minimized-tab-{}", shell.id)))
+                    .h(px(32.0))
+                    .w(px(196.0))
+                    .flex_none()
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .overflow_hidden()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(0x313244))
+                    .bg(rgb(0x1e1e2e))
+                    .text_color(rgb(0xcdd6f4))
+                    .cursor_pointer()
+                    .hover(|tab| tab.bg(rgb(0x29293d)).border_color(rgb(0x585b70)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.activate_sidebar_shell(&shell_id, window, cx);
+                    }))
+                    .child(div().size_1().flex_none().rounded_full().bg(rgb(0x6c7086)))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .overflow_hidden()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(shell.name),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "rename-minimized-tab-{}",
+                                        shell.id
+                                    )))
+                                    .w(px(22.0))
+                                    .h(px(22.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .text_xs()
+                                    .text_color(rgb(0x7f849c))
+                                    .hover(|button| {
+                                        button.bg(rgb(0x45475a)).text_color(rgb(0xcdd6f4))
+                                    })
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.open_resource_dialog(
+                                            ResourceDialogKind::Rename,
+                                            rename_target.clone(),
+                                        );
+                                        cx.notify();
+                                    }))
+                                    .child("✎"),
+                            )
+                            .child(div().text_xs().text_color(rgb(0x7f849c)).child("restore")),
+                    )
+            })
+            .collect::<Vec<_>>();
+
+        Some(
+            div()
+                .id("minimized-tab-strip")
+                .h(px(TAB_BAR_HEIGHT))
+                .flex_none()
+                .flex()
+                .items_center()
+                .border_b_1()
+                .border_color(rgb(0x313244))
+                .bg(rgb(0x11111b))
+                .child(
+                    div()
+                        .id("minimized-tabs-previous")
+                        .w(px(28.0))
+                        .h_full()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .border_r_1()
+                        .border_color(rgb(0x313244))
+                        .text_color(rgb(0xa6adc8))
+                        .cursor_pointer()
+                        .hover(|button| button.bg(rgb(0x29293d)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.scroll_minimized_tabs(-1, cx);
+                        }))
+                        .child("‹"),
+                )
+                .child(
+                    div()
+                        .id("minimized-terminal-tabs")
+                        .min_w_0()
+                        .h_full()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px_1()
+                        .overflow_x_scroll()
+                        .track_scroll(&self.minimized_tab_scroll_handle)
+                        .children(tabs),
+                )
+                .child(
+                    div()
+                        .id("minimized-tabs-next")
+                        .w(px(28.0))
+                        .h_full()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .border_l_1()
+                        .border_color(rgb(0x313244))
+                        .text_color(rgb(0xa6adc8))
+                        .cursor_pointer()
+                        .hover(|button| button.bg(rgb(0x29293d)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.scroll_minimized_tabs(1, cx);
+                        }))
+                        .child("›"),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_layout(&self, layout: &Node, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let panes = layout
-            .rects()
+        let animation_duration = self.motion_speed.duration();
+        let mut rects = workspace_layout_rects(layout, self.fullscreen);
+        let paint_last = self.fullscreen.or_else(|| {
+            self.layout_animation
+                .as_ref()
+                .and_then(|animation| animation.paint_last)
+        });
+        paint_layout_pane_last(&mut rects, paint_last);
+        let panes = rects
             .into_iter()
             .map(|(id, target)| {
                 let pane = self.pane(id, cx);
-                let base = div().absolute().p_1().child(pane);
-                if let Some(animation) = &self.layout_animation {
+                let base = div().absolute().p(px(self.pane_gap / 2.0)).child(pane);
+                if let (Some(animation), Some(duration)) =
+                    (&self.layout_animation, animation_duration)
+                {
                     let from = animation.from.get(&id).copied().unwrap_or(target);
                     let animation_id =
                         SharedString::from(format!("layout-reflow-{}-{id}", animation.generation));
                     base.with_animation(
                         animation_id,
-                        Animation::new(LAYOUT_ANIMATION_DURATION).with_easing(ease_out_quint()),
+                        Animation::new(duration).with_easing(ease_out_quint()),
                         move |element, progress| {
                             let rect = interpolate_rect(from, target, progress);
                             element
@@ -3513,10 +6390,15 @@ impl Render for Workspace {
         if window.window_title() != desktop_title {
             window.set_window_title(&desktop_title);
         }
-        let terminal_sizes = self
-            .terminals
-            .keys()
-            .copied()
+        let terminal_ids = self.terminals.keys().copied().collect::<Vec<_>>();
+        let terminal_sizes = terminal_ids
+            .into_iter()
+            .filter(|id| {
+                !self
+                    .minimizing_panes
+                    .iter()
+                    .any(|animation| animation.pane_id == *id)
+            })
             .map(|id| (id, self.terminal_grid_size(id, window)))
             .collect::<Vec<_>>();
         for (id, (rows, cols, pixel_width, pixel_height)) in terminal_sizes {
@@ -3529,144 +6411,192 @@ impl Render for Workspace {
             }
         }
         self.refresh_terminal_images(window);
-        let content = if let Some(id) = self.fullscreen {
-            div()
-                .size_full()
-                .child(self.pane(id, cx))
-                .into_any_element()
+        let tiled = if let Some(layout) = &self.layout {
+            self.render_layout(layout, cx)
         } else {
-            let tiled = if let Some(layout) = &self.layout {
-                self.render_layout(layout, cx)
+            div().size_full().into_any_element()
+        };
+        let lifted_id = match &self.pointer_drag {
+            Some(PointerDrag {
+                pane_id,
+                subject: PointerSubject::Lifted(_),
+                ..
+            }) => Some(*pane_id),
+            _ => None,
+        };
+        let floating_animation = self.floating_animation.clone();
+        let motion_duration = self.motion_speed.duration();
+        let mut floating_panes = self.floating.clone();
+        if let Some(id) = self.fullscreen {
+            if self
+                .layout
+                .as_ref()
+                .is_some_and(|layout| layout.contains(id))
+            {
+                // A maximized tiled pane covers the floating layer as well.
+                floating_panes.clear();
             } else {
-                div().size_full().into_any_element()
-            };
-            let lifted_id = match &self.pointer_drag {
-                Some(PointerDrag {
-                    pane_id,
-                    subject: PointerSubject::Lifted(_),
-                    ..
-                }) => Some(*pane_id),
-                _ => None,
-            };
-            let floating = self
-                .floating
-                .clone()
-                .into_iter()
-                .map(|pane| {
-                    div()
-                        .absolute()
-                        // Floating panes paint above the tiled layout and must
-                        // also own the corresponding pointer hitbox. Without
-                        // occlusion, both overlapping pane hover handlers run
-                        // and the tiled pane behind wins focus last.
-                        .occlude()
-                        // An occluding hitbox also prevents the workspace's
-                        // behind-the-pane move listener from receiving pointer
-                        // events. Track an active drag on the floating layer so
-                        // every pointer sample updates its geometry smoothly.
-                        .on_mouse_move(cx.listener(Self::on_pointer_move))
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(Self::end_pointer_interaction),
-                        )
-                        .on_mouse_up(
-                            MouseButton::Right,
-                            cx.listener(Self::end_pointer_interaction),
-                        )
-                        .left(px(pane.x))
+                floating_panes.sort_by_key(|pane| pane.id == id);
+            }
+        }
+        let floating = floating_panes
+            .into_iter()
+            .map(|stored_pane| {
+                let pane = if self.fullscreen == Some(stored_pane.id) {
+                    workspace_maximized_pane(stored_pane.id, self.panel_size(window), self.pane_gap)
+                } else {
+                    stored_pane
+                };
+                let base = div()
+                    .absolute()
+                    // Floating panes paint above the tiled layout and must
+                    // also own the corresponding pointer hitbox. Without
+                    // occlusion, both overlapping pane hover handlers run
+                    // and the tiled pane behind wins focus last.
+                    .occlude()
+                    // An occluding hitbox also prevents the workspace's
+                    // behind-the-pane move listener from receiving pointer
+                    // events. Track an active drag on the floating layer so
+                    // every pointer sample updates its geometry smoothly.
+                    .on_mouse_move(cx.listener(Self::on_pointer_move))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(Self::end_pointer_interaction),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Right,
+                        cx.listener(Self::end_pointer_interaction),
+                    )
+                    .when(lifted_id == Some(pane.id), |element| element.opacity(0.92))
+                    .child(self.pane(pane.id, cx));
+                if let (Some(animation), Some(duration)) = (
+                    floating_animation
+                        .as_ref()
+                        .filter(|animation| animation.pane_id == pane.id),
+                    motion_duration,
+                ) {
+                    let from = animation.from.clone();
+                    let target = pane.clone();
+                    let animation_id = SharedString::from(format!(
+                        "floating-transition-{}-{}",
+                        animation.generation, pane.id
+                    ));
+                    base.with_animation(
+                        animation_id,
+                        Animation::new(duration).with_easing(ease_out_quint()),
+                        move |element, progress| {
+                            let bounds = interpolate_floating_pane(&from, &target, progress);
+                            element
+                                .left(px(bounds.x))
+                                .top(px(bounds.y))
+                                .w(px(bounds.width))
+                                .h(px(bounds.height))
+                        },
+                    )
+                    .into_any_element()
+                } else {
+                    base.left(px(pane.x))
                         .top(px(pane.y))
                         .w(px(pane.width))
                         .h(px(pane.height))
-                        .when(lifted_id == Some(pane.id), |element| element.opacity(0.92))
-                        .child(self.pane(pane.id, cx))
-                })
-                .collect::<Vec<_>>();
+                        .into_any_element()
+                }
+            })
+            .collect::<Vec<_>>();
 
-            let terminal_area = div()
-                .h_full()
-                .min_w_0()
-                .flex_1()
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .h(px(HEADER_HEIGHT))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .px_4()
-                        .bg(rgb(0x181825))
-                        .border_b_1()
-                        .border_color(rgb(0x313244))
-                        .child(
-                            div()
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .child(desktop_title.clone()),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_3()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(0x7f849c))
-                                        .child("workspace 1  •  master layout"),
-                                )
-                                .child(
-                                    div()
-                                        .id("open-help")
-                                        .size(px(28.0))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(0x45475a))
-                                        .cursor_pointer()
-                                        .text_color(rgb(0xa6adc8))
-                                        .hover(|button| button.bg(rgb(0x313244)))
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            cx.stop_propagation();
-                                            this.toggle_help(&ToggleHelp, window, cx);
-                                        }))
-                                        .child("?"),
-                                ),
-                        ),
-                )
-                .child(
-                    div()
-                        .relative()
-                        .flex_1()
-                        .min_h_0()
-                        .p_2()
-                        .child(tiled)
-                        .children(floating),
-                )
-                .child(
-                    div()
-                        .h(px(FOOTER_HEIGHT))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .px_4()
-                        .bg(rgb(0x181825))
-                        .text_xs()
-                        .text_color(rgb(0x7f849c))
-                        .child(
-                            "F1: help   F6: sidebar   F2: rename   Ctrl+Arrow: focus   Ctrl+Enter: new   Ctrl+W: detach   Ctrl+Shift+W: remove",
-                        ),
-                );
+        let minimizing = self
+            .minimizing_panes
+            .iter()
+            .map(|animation| {
+                let from = animation.from.clone();
+                let target = FloatingPane {
+                    id: animation.pane_id,
+                    x: from.x + from.width / 2.0 - 36.0,
+                    y: 0.0,
+                    width: 72.0,
+                    height: 24.0,
+                };
+                let animation_id = SharedString::from(format!(
+                    "pane-minimize-{}-{}",
+                    animation.generation, animation.pane_id
+                ));
+                div()
+                    .absolute()
+                    .occlude()
+                    .child(self.pane(animation.pane_id, cx))
+                    .with_animation(
+                        animation_id,
+                        Animation::new(animation.duration).with_easing(ease_out_quint()),
+                        move |element, progress| {
+                            let bounds = interpolate_floating_pane(&from, &target, progress);
+                            element
+                                .left(px(bounds.x))
+                                .top(px(bounds.y))
+                                .w(px(bounds.width))
+                                .h(px(bounds.height))
+                                .opacity(1.0 - progress)
+                        },
+                    )
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
 
+        let minimized_tabs = self.minimized_tab_strip(cx);
+        let terminal_area = div()
+            .h_full()
+            .min_w_0()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .when_some(minimized_tabs, |element, tabs| element.child(tabs))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .p(px(self.pane_gap))
+                    .child(tiled)
+                    .children(floating)
+                    .children(minimizing),
+            );
+
+        let target_drawer_width = self.sidebar_width();
+        let sidebar = self.sidebar(cx);
+        let drawer = if let Some(from) = self.drawer_animation_from {
+            let animation_id = SharedString::from(format!(
+                "sidebar-drawer-{}",
+                self.drawer_animation_generation
+            ));
             div()
-                .size_full()
-                .flex()
-                .child(self.sidebar(cx))
-                .child(terminal_area)
+                .h_full()
+                .flex_none()
+                .overflow_hidden()
+                .child(sidebar)
+                .with_animation(
+                    animation_id,
+                    Animation::new(DRAWER_ANIMATION_DURATION).with_easing(ease_out_quint()),
+                    move |element, progress| {
+                        let width = from + (target_drawer_width - from) * progress;
+                        element.w(px(width))
+                    },
+                )
+                .into_any_element()
+        } else {
+            div()
+                .h_full()
+                .w(px(target_drawer_width))
+                .flex_none()
+                .overflow_hidden()
+                .child(sidebar)
                 .into_any_element()
         };
+
+        let content = div()
+            .size_full()
+            .flex()
+            .child(drawer)
+            .child(terminal_area)
+            .into_any_element();
         let sidebar_menu = self.sidebar_menu_overlay(cx);
         let resource_dialog = self.resource_dialog_overlay(cx);
         let help = self.help_overlay(cx);
@@ -3687,10 +6617,29 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::resize_right))
             .on_action(cx.listener(Self::resize_up))
             .on_action(cx.listener(Self::resize_down))
+            .on_action(cx.listener(Self::resize_small_left))
+            .on_action(cx.listener(Self::resize_small_right))
+            .on_action(cx.listener(Self::resize_small_up))
+            .on_action(cx.listener(Self::resize_small_down))
+            .on_action(cx.listener(Self::resize_large_left))
+            .on_action(cx.listener(Self::resize_large_right))
+            .on_action(cx.listener(Self::resize_large_up))
+            .on_action(cx.listener(Self::resize_large_down))
+            .on_action(cx.listener(Self::toggle_split))
+            .on_action(cx.listener(Self::equalize_split))
+            .on_action(cx.listener(Self::swap_split))
+            .on_action(cx.listener(Self::align_floating_left))
+            .on_action(cx.listener(Self::align_floating_right))
+            .on_action(cx.listener(Self::align_floating_up))
+            .on_action(cx.listener(Self::align_floating_down))
+            .on_action(cx.listener(Self::center_floating))
+            .on_action(cx.listener(Self::cycle_pane_next))
+            .on_action(cx.listener(Self::cycle_pane_previous))
             .on_action(cx.listener(Self::new_pane))
             .on_action(cx.listener(Self::close_pane))
             .on_action(cx.listener(Self::toggle_floating))
             .on_action(cx.listener(Self::toggle_fullscreen))
+            .on_action(cx.listener(Self::toggle_sidebar_drawer))
             .on_action(cx.listener(Self::toggle_sidebar_focus))
             .on_action(cx.listener(Self::toggle_help))
             .on_action(cx.listener(Self::rename_resource))
@@ -3744,6 +6693,11 @@ fn workspace_keystroke(keystroke: &gpui::Keystroke) -> bool {
                 | "enter"
                 | "w"
                 | "f"
+                | "s"
+                | "e"
+                | "r"
+                | "c"
+                | "tab"
                 | "space"
         )
 }
@@ -3959,15 +6913,50 @@ fn main() {
             KeyBinding::new("secondary-shift-right", MoveRight, Some("Workspace")),
             KeyBinding::new("secondary-shift-up", MoveUp, Some("Workspace")),
             KeyBinding::new("secondary-shift-down", MoveDown, Some("Workspace")),
-            KeyBinding::new("secondary-alt-h", ResizeLeft, Some("Workspace")),
-            KeyBinding::new("secondary-alt-l", ResizeRight, Some("Workspace")),
-            KeyBinding::new("secondary-alt-k", ResizeUp, Some("Workspace")),
-            KeyBinding::new("secondary-alt-j", ResizeDown, Some("Workspace")),
+            KeyBinding::new("secondary-alt-h", ResizeSmallLeft, Some("Workspace")),
+            KeyBinding::new("secondary-alt-l", ResizeSmallRight, Some("Workspace")),
+            KeyBinding::new("secondary-alt-k", ResizeSmallUp, Some("Workspace")),
+            KeyBinding::new("secondary-alt-j", ResizeSmallDown, Some("Workspace")),
+            KeyBinding::new("secondary-alt-left", ResizeLeft, Some("Workspace")),
+            KeyBinding::new("secondary-alt-right", ResizeRight, Some("Workspace")),
+            KeyBinding::new("secondary-alt-up", ResizeUp, Some("Workspace")),
+            KeyBinding::new("secondary-alt-down", ResizeDown, Some("Workspace")),
+            KeyBinding::new("secondary-alt-shift-h", ResizeLargeLeft, Some("Workspace")),
+            KeyBinding::new("secondary-alt-shift-l", ResizeLargeRight, Some("Workspace")),
+            KeyBinding::new("secondary-alt-shift-k", ResizeLargeUp, Some("Workspace")),
+            KeyBinding::new("secondary-alt-shift-j", ResizeLargeDown, Some("Workspace")),
+            KeyBinding::new(
+                "secondary-alt-shift-left",
+                AlignFloatingLeft,
+                Some("Workspace"),
+            ),
+            KeyBinding::new(
+                "secondary-alt-shift-right",
+                AlignFloatingRight,
+                Some("Workspace"),
+            ),
+            KeyBinding::new("secondary-alt-shift-up", AlignFloatingUp, Some("Workspace")),
+            KeyBinding::new(
+                "secondary-alt-shift-down",
+                AlignFloatingDown,
+                Some("Workspace"),
+            ),
+            KeyBinding::new("secondary-alt-s", ToggleSplit, Some("Workspace")),
+            KeyBinding::new("secondary-alt-e", EqualizeSplit, Some("Workspace")),
+            KeyBinding::new("secondary-alt-r", SwapSplit, Some("Workspace")),
+            KeyBinding::new("secondary-alt-c", CenterFloating, Some("Workspace")),
+            KeyBinding::new("secondary-tab", CyclePaneNext, Some("Workspace")),
+            KeyBinding::new("secondary-shift-tab", CyclePanePrevious, Some("Workspace")),
             KeyBinding::new(KEY_NEW_PANE, NewPane, Some("Workspace")),
             KeyBinding::new(KEY_REMOVE_SHELL, RemoveShell, Some("Workspace")),
             KeyBinding::new(KEY_DETACH_PANE, ClosePane, Some("Workspace")),
             KeyBinding::new(KEY_TOGGLE_FLOATING, ToggleFloating, Some("Workspace")),
             KeyBinding::new(KEY_TOGGLE_FULLSCREEN, ToggleFullscreen, Some("Workspace")),
+            KeyBinding::new(
+                KEY_TOGGLE_SIDEBAR_DRAWER,
+                ToggleSidebarDrawer,
+                Some("Workspace"),
+            ),
             KeyBinding::new(KEY_TOGGLE_HELP, ToggleHelp, Some("Workspace")),
             KeyBinding::new(KEY_TOGGLE_HELP, ToggleHelp, Some("Help")),
             KeyBinding::new(KEY_TOGGLE_SIDEBAR, ToggleSidebarFocus, Some("Workspace")),
@@ -4013,7 +7002,26 @@ mod pointer_tests {
 
     #[test]
     fn pointer_coordinates_use_the_terminal_panel_origin() {
-        assert_eq!(window_point_to_panel(425.0, 92.0), (125.0, 50.0));
+        assert_eq!(
+            window_point_to_panel(425.0, 92.0, SIDEBAR_WIDTH),
+            (125.0, 92.0)
+        );
+        assert_eq!(window_point_to_panel(425.0, 92.0, 0.0), (425.0, 92.0));
+    }
+
+    #[test]
+    fn keyboard_sidebar_focus_ignores_stationary_pointer_hover() {
+        let anchor = (900.0, 400.0);
+        assert!(!pointer_moved_from(anchor, anchor));
+        assert!(!pointer_moved_from(anchor, (900.4, 400.4)));
+        assert!(pointer_moved_from(anchor, (901.0, 400.0)));
+        assert!(pointer_moved_from(anchor, (900.0, 399.0)));
+    }
+
+    #[test]
+    fn zero_spacing_removes_the_outer_workspace_inset() {
+        assert_eq!(inset_panel_size((1200.0, 800.0), 0.0), (1200.0, 800.0));
+        assert_eq!(inset_panel_size((1200.0, 800.0), 8.0), (1184.0, 784.0));
     }
 
     #[test]
@@ -4047,6 +7055,50 @@ mod pointer_tests {
     }
 
     #[test]
+    fn workspace_maximize_preserves_layout_and_paints_the_target_last() {
+        let mut layout = Node::pane(1);
+        layout.split(1, 2, Axis::Horizontal);
+        let original = layout.rects();
+        let maximized = workspace_layout_rects(&layout, Some(1));
+
+        assert_eq!(maximized.last().unwrap().0, 1);
+        let target = maximized.last().unwrap().1;
+        assert_eq!(target.x, 0.0);
+        assert_eq!(target.y, 0.0);
+        assert_eq!(target.width, 1.0);
+        assert_eq!(target.height, 1.0);
+
+        let restored = workspace_layout_rects(&layout, None);
+        for ((original_id, original), (restored_id, restored)) in
+            original.iter().copied().zip(restored.iter().copied())
+        {
+            assert_eq!(original_id, restored_id);
+            assert_eq!(original.x, restored.x);
+            assert_eq!(original.y, restored.y);
+            assert_eq!(original.width, restored.width);
+            assert_eq!(original.height, restored.height);
+        }
+
+        let mut restoring = restored;
+        paint_layout_pane_last(&mut restoring, Some(1));
+        assert_eq!(restoring.last().unwrap().0, 1);
+        assert_eq!(
+            restoring.last().unwrap().1.width,
+            original.iter().find(|(id, _)| *id == 1).unwrap().1.width
+        );
+    }
+
+    #[test]
+    fn floating_workspace_maximize_respects_canvas_spacing() {
+        let maximized = workspace_maximized_pane(7, (1_200.0, 800.0), 8.0);
+        assert_eq!(maximized.id, 7);
+        assert_eq!(maximized.x, 8.0);
+        assert_eq!(maximized.y, 8.0);
+        assert_eq!(maximized.width, 1_176.0);
+        assert_eq!(maximized.height, 776.0);
+    }
+
+    #[test]
     fn keyboard_swap_animates_each_pane_from_its_previous_rect() {
         let mut layout = Node::pane(1);
         layout.split(1, 2, Axis::Horizontal);
@@ -4059,6 +7111,10 @@ mod pointer_tests {
         assert_eq!(animation.get(&2).unwrap().x, before.get(&2).unwrap().x);
         assert_eq!(after.get(&1).unwrap().x, before.get(&2).unwrap().x);
         assert_eq!(after.get(&2).unwrap().x, before.get(&1).unwrap().x);
+
+        let mut paint_order = layout.rects();
+        paint_layout_pane_last(&mut paint_order, Some(1));
+        assert_eq!(paint_order.last().unwrap().0, 1);
     }
 
     #[test]
@@ -4104,6 +7160,381 @@ mod pointer_tests {
         );
         assert_eq!(moved.x, 400.0);
         assert_eq!(moved.y, 0.0);
+    }
+
+    #[test]
+    fn floating_pane_is_clamped_when_the_drawer_reduces_the_panel() {
+        let clamped = clamp_floating_to_panel(
+            FloatingPane {
+                x: 700.0,
+                width: 400.0,
+                ..pane()
+            },
+            (800.0, 600.0),
+        );
+        assert_eq!(clamped.x, 400.0);
+        assert_eq!(clamped.width, 400.0);
+    }
+
+    #[test]
+    fn newly_floating_pane_is_large_and_centered_within_the_panel() {
+        let pane = centered_floating_pane(7, (1_600.0, 900.0), 8.0);
+        assert_eq!(pane.id, 7);
+        assert_eq!(pane.width, 1_100.0);
+        assert_eq!(pane.height, 648.0);
+        assert_eq!(pane.x, 250.0);
+        assert_eq!(pane.y, 126.0);
+    }
+
+    #[test]
+    fn floating_transition_interpolates_position_and_size() {
+        let from = FloatingPane {
+            id: 4,
+            x: 0.0,
+            y: 20.0,
+            width: 400.0,
+            height: 300.0,
+        };
+        let to = FloatingPane {
+            id: 4,
+            x: 200.0,
+            y: 100.0,
+            width: 800.0,
+            height: 600.0,
+        };
+        let midpoint = interpolate_floating_pane(&from, &to, 0.5);
+        assert_eq!(midpoint.x, 100.0);
+        assert_eq!(midpoint.y, 60.0);
+        assert_eq!(midpoint.width, 600.0);
+        assert_eq!(midpoint.height, 450.0);
+    }
+
+    #[test]
+    fn floating_alignment_respects_canvas_edges_and_center() {
+        let pane = FloatingPane {
+            id: 4,
+            x: 200.0,
+            y: 100.0,
+            width: 400.0,
+            height: 300.0,
+        };
+        let left =
+            align_floating_to_panel(pane.clone(), FloatingAlignment::Left, (1_000.0, 800.0), 8.0);
+        let right = align_floating_to_panel(
+            pane.clone(),
+            FloatingAlignment::Right,
+            (1_000.0, 800.0),
+            8.0,
+        );
+        let centered =
+            align_floating_to_panel(pane, FloatingAlignment::Center, (1_000.0, 800.0), 8.0);
+
+        assert_eq!(left.x, 8.0);
+        assert_eq!(right.x, 592.0);
+        assert_eq!((centered.x, centered.y), (300.0, 250.0));
+    }
+
+    #[test]
+    fn floating_keyboard_resize_supports_grow_and_shrink() {
+        let pane = FloatingPane {
+            id: 4,
+            x: 200.0,
+            y: 100.0,
+            width: 400.0,
+            height: 300.0,
+        };
+        let left =
+            resize_floating_in_direction(pane.clone(), Direction::Left, 32.0, (1_000.0, 800.0));
+        let up = resize_floating_in_direction(pane.clone(), Direction::Up, 32.0, (1_000.0, 800.0));
+        let right =
+            resize_floating_in_direction(pane.clone(), Direction::Right, 32.0, (1_000.0, 800.0));
+        let down = resize_floating_in_direction(pane, Direction::Down, 32.0, (1_000.0, 800.0));
+
+        assert_eq!((left.x, left.width), (200.0, 368.0));
+        assert_eq!((up.y, up.height), (100.0, 268.0));
+        assert_eq!(right.width, 432.0);
+        assert_eq!(down.height, 332.0);
+    }
+
+    #[test]
+    fn pane_cycle_wraps_in_both_directions() {
+        let panes = [3, 7, 11];
+        assert_eq!(cycled_pane_id(&panes, 3, false), Some(7));
+        assert_eq!(cycled_pane_id(&panes, 11, false), Some(3));
+        assert_eq!(cycled_pane_id(&panes, 3, true), Some(11));
+        assert_eq!(cycled_pane_id(&[], 3, false), None);
+    }
+
+    #[test]
+    fn minimized_tabs_are_opt_in_and_hide_shell_rows_from_the_sidebar() {
+        assert_eq!(PaneLayoutMode::default(), PaneLayoutMode::Tiled);
+        assert!(pane_layout_supports_scope(
+            PaneLayoutMode::Tiled,
+            WorkspacePaneMode::Mixed
+        ));
+        assert!(!pane_layout_supports_scope(
+            PaneLayoutMode::Tabbed,
+            WorkspacePaneMode::Mixed
+        ));
+
+        let mut layout = Node::pane(1);
+        layout.split(1, 3, Axis::Horizontal);
+        let floating = vec![
+            FloatingPane {
+                id: 9,
+                x: 0.0,
+                y: 0.0,
+                width: 320.0,
+                height: 240.0,
+            },
+            FloatingPane {
+                id: 5,
+                x: 20.0,
+                y: 20.0,
+                width: 320.0,
+                height: 240.0,
+            },
+        ];
+
+        let panes = ordered_pane_ids(Some(&layout), &floating);
+        assert_eq!(panes, vec![1, 3, 5, 9]);
+
+        let workspace = SidebarItem::Workspace("workspace-1".into());
+        let shell = SidebarItem::Shell {
+            workspace_id: "workspace-1".into(),
+            shell_id: "shell-1".into(),
+        };
+        let other_shell = SidebarItem::Shell {
+            workspace_id: "workspace-1".into(),
+            shell_id: "shell-2".into(),
+        };
+        assert!(sidebar_item_visible_in_layout(
+            PaneLayoutMode::Tabbed,
+            &workspace
+        ));
+        assert!(!sidebar_item_visible_in_layout(
+            PaneLayoutMode::Tabbed,
+            &shell
+        ));
+        assert!(!sidebar_item_visible_in_layout(
+            PaneLayoutMode::Tabbed,
+            &other_shell
+        ));
+        assert!(sidebar_item_visible_in_layout(
+            PaneLayoutMode::Tiled,
+            &shell
+        ));
+    }
+
+    #[test]
+    fn motion_speed_offers_instant_fast_and_smooth_timings() {
+        assert_eq!(MotionSpeed::default(), MotionSpeed::Smooth);
+        assert_eq!(MotionSpeed::Instant.duration(), None);
+        assert_eq!(
+            MotionSpeed::Fast.duration(),
+            Some(Duration::from_millis(180))
+        );
+        assert_eq!(
+            MotionSpeed::Smooth.duration(),
+            Some(Duration::from_millis(360))
+        );
+    }
+
+    #[test]
+    fn workspace_pane_scope_is_isolated_by_default() {
+        assert_eq!(WorkspacePaneMode::default(), WorkspacePaneMode::Workspace);
+        let current = HashSet::from(["shell-a".to_string(), "shell-b".to_string()]);
+        let same = HashSet::from(["shell-b".to_string(), "shell-a".to_string()]);
+        let different = HashSet::from(["shell-c".to_string()]);
+
+        assert!(!workspace_open_replaces_panes(
+            WorkspacePaneMode::Workspace,
+            &current,
+            &same
+        ));
+        assert!(workspace_open_replaces_panes(
+            WorkspacePaneMode::Workspace,
+            &current,
+            &different
+        ));
+        assert!(!workspace_open_replaces_panes(
+            WorkspacePaneMode::Mixed,
+            &current,
+            &different
+        ));
+    }
+
+    #[test]
+    fn workspace_reordering_moves_to_either_side_and_keeps_new_items_last() {
+        let mut order = vec!["alpha".into(), "bravo".into(), "charlie".into()];
+        assert!(reorder_workspace(&mut order, "charlie", "alpha", false));
+        assert_eq!(order, ["charlie", "alpha", "bravo"]);
+        assert!(reorder_workspace(&mut order, "charlie", "bravo", true));
+        assert_eq!(order, ["alpha", "bravo", "charlie"]);
+
+        let mut overview = BoomuxOverview {
+            workspaces: ["new-workspace", "bravo", "alpha", "charlie"]
+                .into_iter()
+                .map(|id| terminal::WorkspaceChoice {
+                    id: id.into(),
+                    name: id.into(),
+                    shells: Vec::new(),
+                    agent_count: 0,
+                })
+                .collect(),
+            ..BoomuxOverview::default()
+        };
+        reconcile_workspace_order(&mut order, &mut overview);
+        assert_eq!(order.last().map(String::as_str), Some("new-workspace"));
+        assert_eq!(
+            overview
+                .workspaces
+                .iter()
+                .map(|workspace| workspace.id.as_str())
+                .collect::<Vec<_>>(),
+            order.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn workspace_drag_targets_both_directions_with_expanded_rows() {
+        let workspace = |id: &str, shell_count: usize| terminal::WorkspaceChoice {
+            id: id.into(),
+            name: id.into(),
+            shells: (0..shell_count)
+                .map(|index| ShellChoice {
+                    id: format!("{id}-shell-{index}"),
+                    name: format!("shell-{index}"),
+                    workspace_id: id.into(),
+                    cwd: "/tmp".into(),
+                    status: ShellStatus::Running,
+                    run_id: None,
+                })
+                .collect(),
+            agent_count: 0,
+        };
+        let overview = BoomuxOverview {
+            workspaces: vec![
+                workspace("alpha", 0),
+                workspace("bravo", 2),
+                workspace("charlie", 0),
+            ],
+            ..BoomuxOverview::default()
+        };
+        let expanded = HashSet::from(["bravo".to_string()]);
+
+        assert_eq!(
+            sidebar_workspace_drop_target(&overview, &expanded, PaneLayoutMode::Tiled, -10.0),
+            Some(("alpha".into(), false))
+        );
+        assert_eq!(
+            sidebar_workspace_drop_target(&overview, &expanded, PaneLayoutMode::Tiled, 70.0),
+            Some(("bravo".into(), false))
+        );
+        assert_eq!(
+            sidebar_workspace_drop_target(&overview, &expanded, PaneLayoutMode::Tiled, 175.0),
+            Some(("bravo".into(), true))
+        );
+        assert_eq!(
+            sidebar_workspace_drop_target(&overview, &expanded, PaneLayoutMode::Tiled, 500.0),
+            Some(("charlie".into(), true))
+        );
+
+        let offsets = sidebar_workspace_offsets(&overview, &expanded, PaneLayoutMode::Tiled);
+        assert_eq!(offsets["alpha"], 0.0);
+        assert_eq!(offsets["bravo"], SIDEBAR_WORKSPACE_HEADER_HEIGHT);
+        assert_eq!(offsets["charlie"], 182.0);
+    }
+
+    #[test]
+    fn opening_one_shell_only_replaces_panes_from_another_workspace() {
+        let same_workspace = HashSet::from(["workspace-a".to_string()]);
+        let another_workspace = HashSet::from(["workspace-b".to_string()]);
+
+        assert!(!shell_open_replaces_panes(
+            WorkspacePaneMode::Workspace,
+            &same_workspace,
+            "workspace-a"
+        ));
+        assert!(shell_open_replaces_panes(
+            WorkspacePaneMode::Workspace,
+            &another_workspace,
+            "workspace-a"
+        ));
+        assert!(!shell_open_replaces_panes(
+            WorkspacePaneMode::Mixed,
+            &another_workspace,
+            "workspace-a"
+        ));
+    }
+
+    #[test]
+    fn minimized_shell_identity_survives_workspace_navigation() {
+        let minimized = HashSet::from(["shell-b".to_string()]);
+
+        assert!(!shell_is_minimized(&minimized, "shell-a"));
+        assert!(shell_is_minimized(&minimized, "shell-b"));
+    }
+
+    #[test]
+    fn workspace_mode_collapses_other_sidebar_workspaces() {
+        let mut expanded = HashSet::from(["workspace-a".to_string(), "workspace-b".to_string()]);
+        reveal_opened_workspace(WorkspacePaneMode::Workspace, &mut expanded, "workspace-c");
+        assert_eq!(expanded, HashSet::from(["workspace-c".to_string()]));
+
+        reveal_opened_workspace(WorkspacePaneMode::Mixed, &mut expanded, "workspace-d");
+        assert_eq!(
+            expanded,
+            HashSet::from(["workspace-c".to_string(), "workspace-d".to_string()])
+        );
+    }
+
+    #[test]
+    fn sidebar_distinguishes_focused_open_and_minimized_shells() {
+        assert_eq!(shell_pane_presence(true, true), ShellPanePresence::Focused);
+        assert_eq!(shell_pane_presence(false, true), ShellPanePresence::Open);
+        assert_eq!(
+            shell_pane_presence(false, false),
+            ShellPanePresence::Minimized
+        );
+        assert_eq!(ShellPanePresence::Minimized.label(), "minimized");
+    }
+
+    #[test]
+    fn scrollbar_drag_applies_pointer_delta_to_the_start_offset() {
+        assert_eq!(scrollbar_offset_from_drag(40, 80, -50.0, 80.0), 0);
+        assert_eq!(scrollbar_offset_from_drag(40, 80, 20.0, 80.0), 60);
+        assert_eq!(scrollbar_offset_from_drag(40, 80, 50.0, 80.0), 80);
+    }
+
+    #[test]
+    fn scrollbar_fade_reaches_the_correct_visibility_endpoints() {
+        assert_eq!(scrollbar_fade_opacity(true, 0.0), 0.0);
+        assert_eq!(scrollbar_fade_opacity(true, 1.0), 1.0);
+        assert_eq!(scrollbar_fade_opacity(false, 0.0), 1.0);
+        assert_eq!(scrollbar_fade_opacity(false, 1.0), 0.0);
+        assert!(SCROLLBAR_FADE_IN_DURATION < SCROLLBAR_FADE_OUT_DURATION);
+    }
+
+    #[test]
+    fn mixed_corners_are_stable_and_include_square_and_curved_edges() {
+        let corners = pane_corner_radii(42, PaneCornerStyle::Mixed);
+        assert_eq!(corners, pane_corner_radii(42, PaneCornerStyle::Mixed));
+        assert!(corners.contains(&0.0));
+        assert!(corners.iter().any(|radius| *radius > 0.0));
+        assert!(
+            corners
+                .iter()
+                .all(|radius| [0.0, 3.0, 7.0, 12.0, 18.0].contains(radius))
+        );
+    }
+
+    #[test]
+    fn focus_highlight_strength_blends_between_inactive_and_active_colors() {
+        assert_eq!(blend_rgb(0x313244, 0xcba6f7, 0), 0x313244);
+        assert_eq!(blend_rgb(0x313244, 0xcba6f7, 100), 0xcba6f7);
+        assert_eq!(blend_rgb(0x000000, 0xffffff, 50), 0x808080);
+        assert_eq!(blend_rgb(0x000000, 0xffffff, 200), 0xffffff);
     }
 
     #[test]

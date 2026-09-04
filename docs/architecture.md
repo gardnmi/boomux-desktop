@@ -52,11 +52,24 @@ clips every placement to its pane, and caches GPU images by terminal generation.
 Images are explicitly dropped when their generation disappears or their pane
 closes.
 
+The default presentation draws the binary tile layout and floating layer. The
+optional tabbed-minimization presentation keeps every open pane in that canvas.
+`Ctrl+W` still detaches and releases the pane-owned emulator and GPU state, but
+the minimized Shell is represented in a restorable strip above the canvas and
+is represented only by its restore tab. Tabs hides all nested Shell rows from
+the sidebar, leaving Workspace rows as its navigation surface. Restoring a tab
+creates a new pane attachment without changing Boomux's durable Shell identity.
+
 ## Resource Projection
 
 The sidebar is a bounded, read-only Boomux snapshot. Active Agent rows require an
 exact current ShellRun. Historical records appear only through explicit Boomux
 attention/history semantics; durable records are not assumed to be active.
+
+Workspace ordering is client-owned presentation state keyed by exact Workspace
+identity. Overview refreshes retain the current order, newly discovered
+Workspaces append, and drag or keyboard reordering never mutates Boomux's
+Workspace authority.
 
 ## Dependency Boundary
 

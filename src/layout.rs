@@ -33,6 +33,18 @@ impl Rect {
     fn center(self) -> (f32, f32) {
         (self.x + self.width / 2.0, self.y + self.height / 2.0)
     }
+
+    fn right(self) -> f32 {
+        self.x + self.width
+    }
+
+    fn bottom(self) -> f32 {
+        self.y + self.height
+    }
+}
+
+fn interval_overlap(a_start: f32, a_end: f32, b_start: f32, b_end: f32) -> f32 {
+    a_end.min(b_end) - a_start.max(b_start)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -184,17 +196,96 @@ impl Node {
             .filter(|(id, _)| *id != focused)
             .filter_map(|(id, rect)| {
                 let (x, y) = rect.center();
-                let (primary, secondary) = match direction {
-                    Direction::Left if x < cx => (cx - x, (cy - y).abs()),
-                    Direction::Right if x > cx => (x - cx, (cy - y).abs()),
-                    Direction::Up if y < cy => (cy - y, (cx - x).abs()),
-                    Direction::Down if y > cy => (y - cy, (cx - x).abs()),
+                let (primary, secondary, overlap) = match direction {
+                    Direction::Left if rect.right() <= current.x + f32::EPSILON => (
+                        current.x - rect.right(),
+                        (cy - y).abs(),
+                        interval_overlap(current.y, current.bottom(), rect.y, rect.bottom()),
+                    ),
+                    Direction::Right if rect.x + f32::EPSILON >= current.right() => (
+                        rect.x - current.right(),
+                        (cy - y).abs(),
+                        interval_overlap(current.y, current.bottom(), rect.y, rect.bottom()),
+                    ),
+                    Direction::Up if rect.bottom() <= current.y + f32::EPSILON => (
+                        current.y - rect.bottom(),
+                        (cx - x).abs(),
+                        interval_overlap(current.x, current.right(), rect.x, rect.right()),
+                    ),
+                    Direction::Down if rect.y + f32::EPSILON >= current.bottom() => (
+                        rect.y - current.bottom(),
+                        (cx - x).abs(),
+                        interval_overlap(current.x, current.right(), rect.x, rect.right()),
+                    ),
                     _ => return None,
                 };
-                Some((id, primary + secondary * 2.0))
+                Some((id, overlap <= f32::EPSILON, primary, secondary))
             })
-            .min_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(id, _)| id)
+            .min_by(|a, b| {
+                a.1.cmp(&b.1)
+                    .then_with(|| a.2.total_cmp(&b.2))
+                    .then_with(|| a.3.total_cmp(&b.3))
+            })
+            .map(|(id, _, _, _)| id)
+    }
+
+    pub fn toggle_split(&mut self, focused: usize) -> bool {
+        self.update_nearest_split(focused, |axis, _, _, _| {
+            *axis = match *axis {
+                Axis::Horizontal => Axis::Vertical,
+                Axis::Vertical => Axis::Horizontal,
+            };
+        })
+    }
+
+    pub fn equalize_split(&mut self, focused: usize) -> bool {
+        self.update_nearest_split(focused, |_, ratio, _, _| *ratio = 0.5)
+    }
+
+    pub fn swap_split(&mut self, focused: usize) -> bool {
+        self.update_nearest_split(focused, |_, ratio, first, second| {
+            std::mem::swap(first, second);
+            *ratio = 1.0 - *ratio;
+        })
+    }
+
+    fn update_nearest_split(
+        &mut self,
+        focused: usize,
+        mut update: impl FnMut(&mut Axis, &mut f32, &mut Box<Node>, &mut Box<Node>),
+    ) -> bool {
+        self.update_nearest_split_with(focused, &mut update)
+    }
+
+    fn update_nearest_split_with(
+        &mut self,
+        focused: usize,
+        update: &mut impl FnMut(&mut Axis, &mut f32, &mut Box<Node>, &mut Box<Node>),
+    ) -> bool {
+        let Self::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } = self
+        else {
+            return false;
+        };
+        let focused_first = first.contains(focused);
+        let focused_second = second.contains(focused);
+        if !focused_first && !focused_second {
+            return false;
+        }
+        let child_updated = if focused_first {
+            first.update_nearest_split_with(focused, update)
+        } else {
+            second.update_nearest_split_with(focused, update)
+        };
+        if child_updated {
+            return true;
+        }
+        update(axis, ratio, first, second);
+        true
     }
 
     pub fn swap_panes(&mut self, a: usize, b: usize) {
@@ -217,33 +308,41 @@ impl Node {
     }
 
     pub fn resize(&mut self, focused: usize, direction: Direction, amount: f32) -> bool {
-        match self {
-            Self::Pane(_) => false,
-            Self::Split {
-                axis,
-                ratio,
-                first,
-                second,
-            } => {
-                if *axis == direction.axis()
-                    && (first.contains(focused) || second.contains(focused))
-                {
-                    let focused_first = first.contains(focused);
-                    let toward_second = matches!(direction, Direction::Right | Direction::Down);
-                    let delta = if focused_first == toward_second {
-                        amount
-                    } else {
-                        -amount
-                    };
-                    *ratio = (*ratio + delta).clamp(0.2, 0.8);
-                    true
-                } else if first.contains(focused) {
-                    first.resize(focused, direction, amount)
-                } else {
-                    second.resize(focused, direction, amount)
-                }
-            }
+        let Self::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } = self
+        else {
+            return false;
+        };
+        let focused_first = first.contains(focused);
+        let focused_second = second.contains(focused);
+        if !focused_first && !focused_second {
+            return false;
         }
+
+        // Prefer the closest matching divider inside the focused subtree.
+        let child_resized = if focused_first {
+            first.resize(focused, direction, amount)
+        } else {
+            second.resize(focused, direction, amount)
+        };
+        if child_resized {
+            return true;
+        }
+
+        if *axis != direction.axis() {
+            return false;
+        }
+
+        let delta = match direction {
+            Direction::Left | Direction::Up => -amount,
+            Direction::Right | Direction::Down => amount,
+        };
+        *ratio = (*ratio + delta).clamp(0.2, 0.8);
+        true
     }
 
     /// Moves the nearest matching split divider by a delta expressed as a
@@ -365,6 +464,63 @@ mod tests {
     }
 
     #[test]
+    fn nearest_split_can_be_rotated_equalized_and_swapped() {
+        let mut root = sample();
+        assert!(root.toggle_split(2));
+        match &root {
+            Node::Split { second, .. } => match second.as_ref() {
+                Node::Split { axis, .. } => assert_eq!(*axis, Axis::Horizontal),
+                _ => panic!("expected nested split"),
+            },
+            _ => panic!("expected root split"),
+        }
+
+        if let Node::Split { second, .. } = &mut root
+            && let Node::Split { ratio, .. } = second.as_mut()
+        {
+            *ratio = 0.7;
+        }
+        assert!(root.equalize_split(2));
+        assert_eq!(
+            root.rects()
+                .iter()
+                .find(|(id, _)| *id == 2)
+                .unwrap()
+                .1
+                .width,
+            0.25
+        );
+
+        let before = root.rects();
+        assert!(root.swap_split(2));
+        let after = root.rects();
+        assert_eq!(
+            before.iter().find(|(id, _)| *id == 2).unwrap().1.width,
+            0.25
+        );
+        assert_eq!(after.iter().find(|(id, _)| *id == 2).unwrap().1.width, 0.25);
+        assert!(after.iter().find(|(id, _)| *id == 2).unwrap().1.x > 0.5);
+    }
+
+    #[test]
+    fn directional_neighbors_must_be_beyond_the_relevant_edge() {
+        let root = Node::Split {
+            axis: Axis::Vertical,
+            ratio: 0.5,
+            first: Box::new(Node::Split {
+                axis: Axis::Horizontal,
+                ratio: 0.5,
+                first: Box::new(Node::pane(1)),
+                second: Box::new(Node::pane(2)),
+            }),
+            second: Box::new(Node::pane(3)),
+        };
+
+        assert_eq!(root.neighbor(1, Direction::Right), Some(2));
+        assert_eq!(root.neighbor(1, Direction::Down), Some(3));
+    }
+
+    #[test]
     fn resize_is_bounded() {
         let mut root = sample();
         for _ in 0..20 {
@@ -374,6 +530,35 @@ mod tests {
             Node::Split { ratio, .. } => assert_eq!(ratio, 0.8),
             _ => panic!("expected split"),
         }
+    }
+
+    #[test]
+    fn keyboard_resize_moves_the_nearest_axis_divider_in_both_directions() {
+        let pane_rect = |layout: &Node, pane_id| {
+            layout
+                .rects()
+                .into_iter()
+                .find(|(id, _)| *id == pane_id)
+                .unwrap()
+                .1
+        };
+
+        let mut left_pane = sample();
+        assert!(left_pane.resize(1, Direction::Left, 0.1));
+        assert!((pane_rect(&left_pane, 1).width - 0.4).abs() < f32::EPSILON);
+        assert!(left_pane.resize(1, Direction::Right, 0.1));
+        assert!((pane_rect(&left_pane, 1).width - 0.5).abs() < f32::EPSILON);
+
+        let mut right_pane = sample();
+        assert!(right_pane.resize(2, Direction::Left, 0.1));
+        assert!((pane_rect(&right_pane, 2).width - 0.6).abs() < f32::EPSILON);
+        assert!(right_pane.resize(2, Direction::Right, 0.1));
+        assert!((pane_rect(&right_pane, 2).width - 0.5).abs() < f32::EPSILON);
+
+        assert!(right_pane.resize(2, Direction::Up, 0.1));
+        assert!((pane_rect(&right_pane, 2).height - 0.4).abs() < f32::EPSILON);
+        assert!(right_pane.resize(2, Direction::Down, 0.1));
+        assert!((pane_rect(&right_pane, 2).height - 0.5).abs() < f32::EPSILON);
     }
 
     #[test]

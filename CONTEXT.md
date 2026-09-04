@@ -24,6 +24,9 @@ replacement authority for Boomux resources.
   state such as selection, scrolling, emulator state, and render-image handles.
 - **Tile**: a pane currently placed in the binary split layout.
 - **Floating pane**: a pane with desktop-owned bounds outside the split layout.
+- **Tabbed minimization**: an optional Workspace-only presentation that keeps
+  open panes tiled or floating and represents detached/minimized Shells in a
+  restorable tab strip above the canvas.
 - **Terminal core**: the `libghostty-vt` state machine that interprets one
   attached Shell's byte stream. It does not own the PTY or process.
 - **Desktop overview**: a read-only projection of Boomux Workspaces, Shells, and

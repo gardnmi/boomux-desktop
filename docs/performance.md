@@ -61,6 +61,12 @@ must also track the number and byte size of live image generations.
   and are dropped explicitly afterward.
 - Overview refresh and Boomux requests stay off the render path.
 - Terminal output is coalesced before publishing a new screen snapshot.
+- Absolute scrollbar seeks use one per-pane atomic latest-value mailbox and at
+  most one queued wake-up marker, so pointer movement cannot build an
+  unbounded or stale scroll backlog.
+- A minimized tab owns only Boomux overview identity and presentation metadata;
+  animated minimization retains pane state only for the bounded motion duration,
+  then releases its emulator snapshots and GPU images before adding the tab.
 
 Any new queue, cache, history, retry, image store, or task must document its
 bound and cleanup owner.
