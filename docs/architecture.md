@@ -19,7 +19,11 @@ per-pane reader ── bounded command queue ── libghostty-vt worker
 ```
 
 The client sends input, focus, and terminal-size frames back through the same
-Boomux attachment. Detaching a pane never implies closing its Boomux Shell.
+Boomux attachment. Keystrokes enter the pane's bounded emulator command queue,
+where Ghostty's reusable key encoder reads the current terminal modes before
+encoding and forwarding them; this keeps Kitty keyboard, modifyOtherKeys,
+cursor, keypad, and backarrow negotiation ordered with terminal output.
+Detaching a pane never implies closing its Boomux Shell.
 
 ## Module Map
 
@@ -30,6 +34,8 @@ Boomux attachment. Detaching a pane never implies closing its Boomux Shell.
 - `src/terminal.rs`: Boomux discovery/attachment adapter, per-pane terminal
   worker, Ghostty VT state, scrollback, key/paste encoding, and Kitty graphics
   extraction.
+- `src/theme.rs`: bounded Omarchy palette loading, semantic application and
+  terminal colors, built-in fallback, and the current-theme filesystem watcher.
 
 ## Threading And Backpressure
 
@@ -45,6 +51,14 @@ immutable screen snapshot. A bounded one-event mailbox wakes GPUI only when a
 new snapshot or terminal status exists; bursts collapse into one wakeup because
 the consumer always reads the newest snapshot. Synchronized-output mode delays
 publication until the terminal frame is complete.
+
+Omarchy theme loading follows the same boundary. A native filesystem watcher
+observes `~/.local/state/omarchy/current`, because Omarchy replaces its `theme`
+directory atomically. Its capacity-one notification channel is debounced before
+a bounded `colors.toml` read runs on the background executor. GPUI installs the
+result through atomic semantic color slots and notifies once. Each terminal
+worker receives only its latest pending palette through its existing bounded
+command path and republishes a screen without reconnecting the Boomux Shell.
 
 ## Rendering
 
@@ -69,6 +83,10 @@ creates a new pane attachment without changing Boomux's durable Shell identity.
 The sidebar is a bounded, read-only Boomux snapshot. Active Agent rows require an
 exact current ShellRun. Historical records appear only through explicit Boomux
 attention/history semantics; durable records are not assumed to be active.
+The client keeps a bounded presentation marker for an observed `working` to
+`idle` transition so successful completion remains visible until the user
+dismisses it. This does not change the Agent lifecycle. Durable attention is
+acknowledged against Boomux with the exact Agent ID and observation revision.
 
 Workspace ordering is client-owned presentation state keyed by exact Workspace
 identity. Overview refreshes retain the current order, newly discovered

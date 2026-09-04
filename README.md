@@ -11,7 +11,7 @@ The prototype uses [GPUI Community Edition](https://gpui-ce.github.io/) and `lib
 
 The layout panes are managed inside one GPUI window, and every pane hosts an independent **real local Boomux shell**. Each pane renders its shell's terminal output in GPUI and sends keyboard input and terminal resize events back through Boomux's attachment protocol. This lets us test the product shape without embedding Wayland client buffers or running a terminal emulator process per tile.
 
-An Omarchy Boomux-inspired sidebar presents the local workspace tree, shell status, and current/attention-bearing agents. Workspace rows expand and collapse. Clicking a shell or agent focuses its existing tile, or attaches its shell in a new tile when it is not already open. The overview refreshes from Boomux in the background without putting daemon requests on the GPUI render path. Nodes and web controls remain outside this proof of concept.
+An Omarchy Boomux-inspired sidebar presents the local workspace tree, shell status, and current/attention-bearing agents. When an agent settles from working to idle, its row remains marked **finished** until **Dismiss** is clicked; durable Boomux attention is acknowledged with the exact observation revision. Workspace rows expand and collapse. Clicking a shell or agent focuses its existing tile, or attaches its shell in a new tile when it is not already open. The overview refreshes from Boomux in the background without putting daemon requests on the GPUI render path. Nodes and web controls remain outside this proof of concept.
 
 ## Run it
 
@@ -89,6 +89,12 @@ The prototype uses Ctrl on Linux so its input reaches the app while it is runnin
 | `Super + C/V` on Omarchy | Universal copy/paste through Omarchy's terminal bindings |
 | `Middle click` | Paste the Linux primary selection into the focused terminal |
 
+Terminal keys use Ghostty's negotiated keyboard encoder. `Shift+Enter` uses the
+portable Ctrl+J newline representation so it continues to insert a newline in
+Codex even after attaching to an existing Shell whose earlier Kitty keyboard
+negotiation is unavailable; plain `Enter` still submits. Other legacy keys
+retain their conventional encodings.
+
 While the sidebar has keyboard focus, `Up`/`Down` or `J`/`K` moves through
 visible rows, `Left`/`Right` or `H`/`L` collapses and expands Workspaces,
 `Enter` opens the selected Workspace or Shell, `Space` toggles a Workspace's
@@ -107,6 +113,17 @@ Settings, Keyboard Shortcuts, and Hide Sidebar in its overflow menu. Settings
 opens as a scrollable sidebar screen with consistent segmented and stepper
 controls, and can disable removal confirmations. `Ctrl+B` opens the sidebar
 again after it has been closed.
+
+On Omarchy, Boomux Desktop follows the active system theme automatically. It
+loads the semantic palette and terminal ANSI colors from
+`~/.local/state/omarchy/current/theme/colors.toml`, then watches Omarchy's
+atomically replaced `current` theme directory for live changes. The sidebar,
+settings, dialogs, pane chrome, focus treatment, terminal defaults, cursor, and
+ANSI palette update without restarting or reconnecting panes. A missing or
+invalid Omarchy theme uses Boomux Desktop's built-in palette, which also keeps
+the application usable on non-Omarchy systems. Settings reports whether the
+Omarchy provider or the fallback is active.
+
 Settings default to **Workspace** pane scope: opening a Workspace replaces the
 canvas with its remembered non-minimized Shells, while opening a Shell restores
 only that Shell. **Mixed** scope preserves the free-form behavior where Shells

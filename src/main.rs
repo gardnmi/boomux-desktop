@@ -1,25 +1,28 @@
 mod generated_names;
 mod layout;
 mod terminal;
+mod theme;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use boomux::protocol::AgentState;
 use gpui::{
     Animation, AnimationExt, App, Bounds, ClickEvent, ClipboardItem, Context, Corners, CursorStyle,
     Div, DragMoveEvent, FocusHandle, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, RenderImage, ScrollAnchor,
-    ScrollHandle, ScrollWheelEvent, ShapedLine, SharedString, Stateful, TextRun, UnderlineStyle,
-    Window, WindowBounds, WindowOptions, actions, canvas, div, ease_out_quint, fill, font, point,
-    prelude::*, px, relative, rgb, rgb_to_hsla, rgba, size,
+    KeyUpEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, RenderImage,
+    ScrollAnchor, ScrollHandle, ScrollWheelEvent, ShapedLine, SharedString, Stateful, TextRun,
+    UnderlineStyle, Window, WindowBounds, WindowOptions, actions, canvas, div, ease_out_quint,
+    fill, font, point, prelude::*, px, relative, rgb_to_hsla, rgba, size,
 };
 use layout::{Axis, Direction, Node, Rect};
 use terminal::{
     AgentChoice, BoomuxOverview, ShellChoice, TerminalImagePlacement, TerminalScreen,
     TerminalSession,
 };
+use theme::{AppTheme, ThemeWatcher};
 
 const TAB_BAR_HEIGHT: f32 = 40.0;
 const MIN_FLOAT_WIDTH: f32 = 220.0;
@@ -32,6 +35,10 @@ const DRAWER_ANIMATION_DURATION: Duration = Duration::from_millis(180);
 const SCROLLBAR_FADE_IN_DURATION: Duration = Duration::from_millis(180);
 const SCROLLBAR_FADE_OUT_DURATION: Duration = Duration::from_millis(360);
 const DRAG_ACTIVATION_DISTANCE: f32 = 4.0;
+
+fn rgb(color: u32) -> gpui::Rgba {
+    gpui::rgb(theme::resolve_legacy(color))
+}
 
 actions!(
     compositor,
@@ -396,6 +403,30 @@ fn visible_sidebar_items(
         shell_id: agent.shell_id.clone(),
     }));
     items
+}
+
+fn reconcile_completed_agents(
+    previous_states: &mut HashMap<String, AgentState>,
+    completed_agents: &mut HashSet<String>,
+    agents: &[AgentChoice],
+) {
+    let current_idle_agents = agents
+        .iter()
+        .filter(|agent| agent.state == AgentState::Idle)
+        .map(|agent| agent.id.clone())
+        .collect::<HashSet<_>>();
+    completed_agents.retain(|agent_id| current_idle_agents.contains(agent_id));
+
+    for agent in agents {
+        if agent.state == AgentState::Idle
+            && previous_states.get(&agent.id) == Some(&AgentState::Working)
+        {
+            completed_agents.insert(agent.id.clone());
+        }
+    }
+
+    previous_states.clear();
+    previous_states.extend(agents.iter().map(|agent| (agent.id.clone(), agent.state)));
 }
 
 fn reconcile_workspace_order(order: &mut Vec<String>, overview: &mut BoomuxOverview) {
@@ -1189,6 +1220,9 @@ struct Workspace {
     fullscreen: Option<usize>,
     boomux_shells: Vec<ShellChoice>,
     boomux_overview: BoomuxOverview,
+    previous_agent_states: HashMap<String, AgentState>,
+    completed_agents: HashSet<String>,
+    dismissing_agents: HashSet<String>,
     workspace_order: Vec<String>,
     boomux_error: Option<String>,
     expanded_workspaces: HashSet<String>,
@@ -1213,9 +1247,14 @@ struct Workspace {
     pane_layout_mode: PaneLayoutMode,
     minimized_shells: HashSet<String>,
     confirm_destructive_actions: bool,
+    theme: AppTheme,
+    theme_watcher: Option<ThemeWatcher>,
+    theme_load_generation: u64,
+    theme_error: Option<String>,
     settings_open: bool,
     help_open: bool,
     help_scroll_handle: ScrollHandle,
+    terminal_pressed_keys: HashMap<String, usize>,
     terminals: HashMap<usize, TerminalPane>,
     next_id: usize,
     focus_handle: FocusHandle,
@@ -1317,7 +1356,14 @@ impl Workspace {
             focused: 1,
             fullscreen: None,
             boomux_shells,
+            previous_agent_states: boomux_overview
+                .agents
+                .iter()
+                .map(|agent| (agent.id.clone(), agent.state))
+                .collect(),
             boomux_overview,
+            completed_agents: HashSet::new(),
+            dismissing_agents: HashSet::new(),
             workspace_order,
             boomux_error,
             expanded_workspaces,
@@ -1342,9 +1388,14 @@ impl Workspace {
             pane_layout_mode: PaneLayoutMode::Tiled,
             minimized_shells: HashSet::new(),
             confirm_destructive_actions: true,
+            theme: AppTheme::default(),
+            theme_watcher: None,
+            theme_load_generation: 0,
+            theme_error: None,
             settings_open: false,
             help_open: false,
             help_scroll_handle,
+            terminal_pressed_keys: HashMap::new(),
             terminals,
             next_id: 2,
             focus_handle,
@@ -1354,8 +1405,68 @@ impl Workspace {
             let shell_id = shell.id.clone();
             workspace.open_workspace(&workspace_id, Some(&shell_id), window, cx);
         }
+        workspace.watch_omarchy_theme(cx);
         workspace.watch_boomux_overview(cx);
         workspace
+    }
+
+    fn watch_omarchy_theme(&mut self, cx: &mut Context<Self>) {
+        let Some(state_directory) = theme::omarchy_state_directory() else {
+            return;
+        };
+        let colors_path = theme::omarchy_colors_path(&state_directory);
+        match ThemeWatcher::new(&state_directory) {
+            Ok(watcher) => {
+                let updates = watcher.updates.clone();
+                self.theme_watcher = Some(watcher);
+                let watched_colors_path = colors_path.clone();
+                cx.spawn(async move |this, cx| {
+                    while updates.recv().await.is_ok() {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(100))
+                            .await;
+                        while updates.try_recv().is_ok() {}
+                        this.update(cx, |this, cx| {
+                            this.reload_omarchy_theme(watched_colors_path.clone(), cx);
+                        })
+                        .ok();
+                    }
+                })
+                .detach();
+            }
+            Err(error) => self.theme_error = Some(error),
+        }
+        self.reload_omarchy_theme(colors_path, cx);
+    }
+
+    fn reload_omarchy_theme(&mut self, colors_path: std::path::PathBuf, cx: &mut Context<Self>) {
+        self.theme_load_generation = self.theme_load_generation.wrapping_add(1);
+        let generation = self.theme_load_generation;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { AppTheme::load_omarchy(&colors_path) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.theme_load_generation != generation {
+                    return;
+                }
+                match result {
+                    Ok(theme) => {
+                        this.theme = theme;
+                        theme::install(theme);
+                        this.theme_error = this.terminals.values().find_map(|pane| {
+                            pane.session
+                                .as_ref()
+                                .and_then(|session| session.set_theme(theme.terminal).err())
+                        });
+                    }
+                    Err(error) => this.theme_error = Some(error),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn focus_direction(
@@ -1492,6 +1603,11 @@ impl Workspace {
 
     fn set_boomux_overview(&mut self, mut overview: BoomuxOverview) {
         reconcile_workspace_order(&mut self.workspace_order, &mut overview);
+        reconcile_completed_agents(
+            &mut self.previous_agent_states,
+            &mut self.completed_agents,
+            &overview.agents,
+        );
         self.boomux_shells = overview
             .workspaces
             .iter()
@@ -1499,6 +1615,50 @@ impl Workspace {
             .collect();
         self.retain_known_minimized_shells(&overview);
         self.boomux_overview = overview;
+    }
+
+    fn dismiss_agent_notification(
+        &mut self,
+        agent_id: String,
+        attention_revision: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        self.completed_agents.remove(&agent_id);
+        let Some(revision) = attention_revision else {
+            cx.notify();
+            return;
+        };
+        if !self.dismissing_agents.insert(agent_id.clone()) {
+            return;
+        }
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn({
+                    let agent_id = agent_id.clone();
+                    async move {
+                        terminal::acknowledge_agent_attention(&agent_id, revision)?;
+                        terminal::discover_overview()
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.dismissing_agents.remove(&agent_id);
+                match result {
+                    Ok(overview) => {
+                        this.set_boomux_overview(overview);
+                        this.boomux_error = None;
+                        if this.navigation_region == NavigationRegion::Sidebar {
+                            this.reconcile_sidebar_item();
+                        }
+                    }
+                    Err(error) => this.boomux_error = Some(error),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn reorder_workspace_relative(
@@ -2703,13 +2863,14 @@ impl Workspace {
         &mut self,
         id: usize,
         event: &ScrollWheelEvent,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.pointer_drag.is_some() {
             return;
         }
 
+        let mouse_geometry = self.terminal_mouse_geometry(id, event, window);
         let Some(pane) = self.terminals.get_mut(&id) else {
             return;
         };
@@ -2730,9 +2891,38 @@ impl Workspace {
             return;
         }
         pane.scroll_remainder -= lines as f32 * TERMINAL_CELL_HEIGHT;
-        if terminal.scroll(-lines) {
+        if mouse_geometry.is_some_and(|(position, screen_size)| {
+            terminal.report_mouse_wheel(lines, position, screen_size, event.modifiers)
+        }) || terminal.scroll(-lines)
+        {
             cx.stop_propagation();
         }
+    }
+
+    fn terminal_mouse_geometry(
+        &self,
+        id: usize,
+        event: &ScrollWheelEvent,
+        window: &Window,
+    ) -> Option<((f32, f32), (u32, u32))> {
+        let pane = self.pane_bounds_in_panel(id, window)?;
+        let pointer =
+            self.window_position_in_panel(f32::from(event.position.x), f32::from(event.position.y));
+        let frame_inset = self.pane_gap / 2.0 + 2.0;
+        let heading_height = if self.pane_headings_visible {
+            38.0
+        } else {
+            0.0
+        };
+        let x = pointer.0 - pane.x - frame_inset;
+        let y = pointer.1 - pane.y - frame_inset - heading_height;
+        let (_, _, pixel_width, pixel_height) = self.terminal_grid_size(id, window);
+        let screen_width = u32::from(pixel_width) + TERMINAL_PADDING as u32;
+        let screen_height = u32::from(pixel_height) + TERMINAL_PADDING as u32;
+        if x < 0.0 || y < 0.0 || x >= screen_width as f32 || y >= screen_height as f32 {
+            return None;
+        }
+        Some(((x, y), (screen_width, screen_height)))
     }
 
     fn begin_terminal_scrollbar_drag(
@@ -3420,16 +3610,47 @@ impl Workspace {
         if workspace_keystroke(&event.keystroke) {
             return;
         }
-        let sent = pane
-            .session
-            .as_ref()
-            .is_some_and(|terminal| terminal.send_key(&event.keystroke));
+        let sent = pane.session.as_ref().is_some_and(|terminal| {
+            terminal.send_key(
+                &event.keystroke,
+                if event.is_held {
+                    libghostty_vt::key::Action::Repeat
+                } else {
+                    libghostty_vt::key::Action::Press
+                },
+            )
+        });
         if sent {
+            if !event.is_held {
+                self.terminal_pressed_keys
+                    .insert(event.keystroke.key.clone(), self.focused);
+            }
             if let Some(pane) = self.terminals.get_mut(&self.focused) {
                 pane.selection = None;
             }
             cx.stop_propagation();
             cx.notify();
+        }
+    }
+
+    fn terminal_key_up(
+        &mut self,
+        event: &KeyUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pane_id) = self.terminal_pressed_keys.remove(&event.keystroke.key) else {
+            return;
+        };
+        let sent = self
+            .terminals
+            .get(&pane_id)
+            .and_then(|pane| pane.session.as_ref())
+            .is_some_and(|terminal| {
+                terminal.send_key(&event.keystroke, libghostty_vt::key::Action::Release)
+            });
+        if sent {
+            cx.stop_propagation();
         }
     }
 
@@ -4291,6 +4512,28 @@ impl Workspace {
                         }))
                         .child(div().min_w_0().flex_1().child("Settings"))
                         .child(div().flex_none().text_color(rgb(0x7f849c)).child("⚙")),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x7f849c))
+                                .child("System theme"),
+                        )
+                        .child(div().text_sm().text_color(rgb(0xcdd6f4)).child(
+                            if self.theme_watcher.is_some() && self.theme_error.is_none() {
+                                "Following Omarchy"
+                            } else {
+                                "Built-in fallback"
+                            },
+                        ))
+                        .when_some(self.theme_error.clone(), |section, error| {
+                            section.child(div().text_xs().text_color(rgb(0xf38ba8)).child(error))
+                        }),
                 )
                 .child(
                     div()
@@ -6063,18 +6306,24 @@ impl Workspace {
             && self.sidebar_item.as_ref() == Some(&agent_item);
         let selected = focused_shell_id == Some(agent.shell_id.as_str());
         let state = agent.state_label();
+        let completed = agent.completed_attention || self.completed_agents.contains(&agent.id);
+        let dismissible = completed || agent.needs_attention;
+        let dismissing = self.dismissing_agents.contains(&agent.id);
+        let dismiss_agent_id = agent.id.clone();
+        let dismiss_element_id = agent.id.clone();
+        let attention_revision = agent.attention_revision;
         let glyph = if agent.needs_attention {
             "!"
         } else if state == "working" {
             "●"
-        } else if state == "finished" {
+        } else if completed || state == "finished" {
             "✓"
         } else {
             "○"
         };
         let glyph_color = if agent.needs_attention {
             0xf38ba8
-        } else if selected || matches!(state, "working" | "finished") {
+        } else if selected || completed || matches!(state, "working" | "finished") {
             0x89b4fa
         } else {
             0x6c7086
@@ -6136,10 +6385,39 @@ impl Workspace {
                             })
                             .child(format!(
                                 "{} · {} · {}",
-                                state, agent.workspace, agent.integration
+                                if completed { "finished" } else { state },
+                                agent.workspace,
+                                agent.integration
                             )),
                     ),
             )
+            .when(dismissible, |row| {
+                row.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "dismiss-agent-{dismiss_element_id}"
+                        )))
+                        .flex_none()
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(rgb(0x6c7086))
+                        .text_xs()
+                        .text_color(rgb(0xcdd6f4))
+                        .cursor_pointer()
+                        .hover(|element| element.bg(rgb(0x313244)))
+                        .child(if dismissing { "…" } else { "Dismiss" })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.dismiss_agent_notification(
+                                dismiss_agent_id.clone(),
+                                attention_revision,
+                                cx,
+                            );
+                        })),
+                )
+            })
     }
 
     fn boomux_body(&self, pane_id: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -6285,8 +6563,16 @@ impl Workspace {
         );
         let accent = rgb(0xa6e3a1);
         let corners = pane_corner_radii(id, self.pane_corner_style);
-        let focused_border = blend_rgb(0x313244, 0xcba6f7, self.focus_highlight_strength);
-        let focused_heading = blend_rgb(0x1e1e2e, 0x313244, self.focus_highlight_strength);
+        let focused_border = blend_rgb(
+            theme::resolve_legacy(0x313244),
+            theme::resolve_legacy(0xcba6f7),
+            self.focus_highlight_strength,
+        );
+        let focused_heading = blend_rgb(
+            theme::resolve_legacy(0x1e1e2e),
+            theme::resolve_legacy(0x313244),
+            self.focus_highlight_strength,
+        );
         let status_message = pane
             .and_then(|pane| pane.session.as_ref())
             .and_then(TerminalSession::status_message);
@@ -6303,7 +6589,7 @@ impl Workspace {
             .rounded_bl(px(corners[3]))
             .border_2()
             .border_color(if focused {
-                rgb(focused_border)
+                gpui::rgb(focused_border)
             } else {
                 rgb(0x313244)
             })
@@ -6337,7 +6623,7 @@ impl Workspace {
                         .justify_between()
                         .px_3()
                         .bg(if focused {
-                            rgb(focused_heading)
+                            gpui::rgb(focused_heading)
                         } else {
                             rgb(0x1e1e2e)
                         })
@@ -6996,6 +7282,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::paste_clipboard))
             .on_key_down(cx.listener(Self::terminal_key_down))
+            .on_key_up(cx.listener(Self::terminal_key_up))
             .on_mouse_move(cx.listener(Self::on_pointer_move))
             .on_mouse_up(
                 MouseButton::Left,
@@ -7103,6 +7390,7 @@ fn prepare_terminal_paint(
     selection: Option<TerminalSelection>,
     window: &mut Window,
 ) -> TerminalPaintCache {
+    let terminal_theme = theme::current_terminal();
     let cols = usize::from(screen.cols);
     let mut lines = Vec::with_capacity(usize::from(screen.rows));
     let mut backgrounds = Vec::new();
@@ -7119,13 +7407,16 @@ fn prepare_terminal_paint(
                 (start..=end).contains(&index)
             });
             let (foreground, background) = if selected {
-                (0xcdd6f4, 0x45475a)
+                (
+                    theme::resolve_legacy(0xcdd6f4),
+                    theme::resolve_legacy(0xf5e0dc),
+                )
             } else if cell.cursor {
-                (0x1e1e2e, 0xcba6f7)
+                (terminal_theme.background, terminal_theme.cursor)
             } else {
                 (cell.foreground, cell.background)
             };
-            if background != 0x11111b {
+            if background != terminal_theme.background {
                 backgrounds.push(TerminalBackground {
                     row,
                     col,
@@ -7153,10 +7444,10 @@ fn prepare_terminal_paint(
                 TextRun {
                     len: text.len() - start,
                     font: cell_font,
-                    color: rgb_to_hsla(rgb(foreground)),
+                    color: rgb_to_hsla(gpui::rgb(foreground)),
                     underline: cell.underline.then_some(UnderlineStyle {
                         thickness: px(1.0),
-                        color: Some(rgb_to_hsla(rgb(foreground))),
+                        color: Some(rgb_to_hsla(gpui::rgb(foreground))),
                         wavy: false,
                     }),
                     ..Default::default()
@@ -7197,7 +7488,7 @@ fn terminal_view(paint_cache: Arc<TerminalPaintCache>, images: Vec<RenderedTermi
                             ),
                             size(px(TERMINAL_CELL_WIDTH), px(TERMINAL_CELL_HEIGHT)),
                         ),
-                        rgb(background.color),
+                        gpui::rgb(background.color),
                     ));
                 }
                 paint_terminal_images(bounds, &images, |z| (i32::MIN / 2..0).contains(&z), window);
@@ -7442,6 +7733,18 @@ mod pointer_tests {
         assert!(!pointer_moved_from(anchor, (900.4, 400.4)));
         assert!(pointer_moved_from(anchor, (901.0, 400.0)));
         assert!(pointer_moved_from(anchor, (900.0, 399.0)));
+    }
+
+    #[test]
+    fn shift_enter_is_terminal_input_not_a_workspace_shortcut() {
+        assert!(!workspace_keystroke(&gpui::Keystroke {
+            key: "enter".into(),
+            key_char: None,
+            modifiers: gpui::Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        }));
     }
 
     #[test]
@@ -8008,10 +8311,38 @@ mod pointer_tests {
 
     #[test]
     fn focus_highlight_strength_blends_between_inactive_and_active_colors() {
-        assert_eq!(blend_rgb(0x313244, 0xcba6f7, 0), 0x313244);
-        assert_eq!(blend_rgb(0x313244, 0xcba6f7, 100), 0xcba6f7);
-        assert_eq!(blend_rgb(0x000000, 0xffffff, 50), 0x808080);
-        assert_eq!(blend_rgb(0x000000, 0xffffff, 200), 0xffffff);
+        assert_eq!(
+            blend_rgb(
+                theme::resolve_legacy(0x313244),
+                theme::resolve_legacy(0xcba6f7),
+                0
+            ),
+            0x313244
+        );
+        assert_eq!(
+            blend_rgb(
+                theme::resolve_legacy(0x313244),
+                theme::resolve_legacy(0xcba6f7),
+                100
+            ),
+            0xcba6f7
+        );
+        assert_eq!(
+            blend_rgb(
+                theme::resolve_legacy(0x000000),
+                theme::resolve_legacy(0xffffff),
+                50
+            ),
+            0x808080
+        );
+        assert_eq!(
+            blend_rgb(
+                theme::resolve_legacy(0x000000),
+                theme::resolve_legacy(0xffffff),
+                200
+            ),
+            0xffffff
+        );
     }
 
     #[test]
@@ -8094,9 +8425,53 @@ mod pointer_tests {
                 state: AgentState::Idle,
                 updated_at_ms: 1,
                 needs_attention: false,
+                completed_attention: false,
+                attention_revision: None,
             }],
             focused_shell_id: Some("shell-1".into()),
         }
+    }
+
+    #[test]
+    fn working_to_idle_agent_completion_remains_until_dismissed() {
+        let mut previous = HashMap::from([("agent-1".into(), AgentState::Working)]);
+        let mut completed = HashSet::new();
+        let mut agents = sidebar_overview().agents;
+        agents[0].state = AgentState::Idle;
+
+        reconcile_completed_agents(&mut previous, &mut completed, &agents);
+        assert!(completed.contains("agent-1"));
+
+        reconcile_completed_agents(&mut previous, &mut completed, &agents);
+        assert!(completed.contains("agent-1"));
+
+        completed.remove("agent-1");
+        reconcile_completed_agents(&mut previous, &mut completed, &agents);
+        assert!(!completed.contains("agent-1"));
+    }
+
+    #[test]
+    fn resumed_agent_clears_its_previous_completion() {
+        let mut previous = HashMap::from([("agent-1".into(), AgentState::Idle)]);
+        let mut completed = HashSet::from(["agent-1".into()]);
+        let mut agents = sidebar_overview().agents;
+        agents[0].state = AgentState::Working;
+
+        reconcile_completed_agents(&mut previous, &mut completed, &agents);
+
+        assert!(!completed.contains("agent-1"));
+        assert_eq!(previous.get("agent-1"), Some(&AgentState::Working));
+    }
+
+    #[test]
+    fn completion_tracking_is_bounded_to_agents_in_the_overview() {
+        let mut previous = HashMap::from([("removed-agent".into(), AgentState::Working)]);
+        let mut completed = HashSet::from(["removed-agent".into()]);
+
+        reconcile_completed_agents(&mut previous, &mut completed, &[]);
+
+        assert!(previous.is_empty());
+        assert!(completed.is_empty());
     }
 
     #[test]

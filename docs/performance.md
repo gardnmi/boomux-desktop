@@ -53,6 +53,9 @@ must also track the number and byte size of live image generations.
 ## Current Guardrails
 
 - The emulator command queue is bounded at 64 chunks per pane.
+- Keyboard events share that bounded per-pane queue and are encoded by one
+  reusable Ghostty encoder on the emulator worker, so mode changes and input
+  remain ordered without a per-pane input buffer or encoder allocation.
 - Ghostty's Kitty image storage is capped at 64 MiB per pane. This is a safety
   ceiling, not a desired steady-state footprint; a global or workload-sensitive
   budget should replace it if measurements show poor multi-pane scaling.
@@ -80,6 +83,10 @@ must also track the number and byte size of live image generations.
   then releases its emulator snapshots and GPU images before adding the tab.
 - A Workspace switch retains outgoing pane state only for the selected bounded
   motion duration, then detaches it and releases its emulator and GPU resources.
+- Omarchy theme changes are event-driven rather than polled. Watcher events
+  coalesce in a capacity-one channel, theme files are capped at 64 KiB and read
+  off the GPUI thread, UI color lookup is allocation-free, and each emulator
+  worker owns at most one pending terminal palette update.
 
 Any new queue, cache, history, retry, image store, or task must document its
 bound and cleanup owner.

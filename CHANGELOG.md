@@ -4,6 +4,15 @@ All notable changes to Boomux Desktop will be documented in this file.
 
 ## Unreleased
 
+- Keep working-to-idle Agents visibly marked as finished until dismissed, and
+  acknowledge durable Boomux attention by exact observation revision.
+- Preserve modified special keys and key actions through Ghostty's
+  terminal-mode-aware keyboard encoder, with a portable `Shift+Enter` newline
+  fallback for reattached TUIs whose Kitty keyboard mode cannot be reconstructed.
+- Follow Omarchy's active semantic and terminal palette with event-driven live
+  reload, bounded theme reads, and a built-in fallback for other systems.
+- Forward scroll-wheel events to full-screen terminal applications when they
+  enable mouse tracking, while preserving ordinary terminal scrollback.
 - Make terminal updates event-driven and coalesced, share immutable screen
   snapshots, cache shaped paint data across layout-only frames, inline common
   cell text, and reuse unchanged Kitty image pixels to reduce idle and animation

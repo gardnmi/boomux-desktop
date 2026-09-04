@@ -9,11 +9,20 @@ use std::time::Duration;
 
 use boomux::client::{self, Client};
 use boomux::protocol::{
-    AgentState, AttachFrame, ShellSnapshot, ShellSpec, ShellStatus, TerminalProfile,
+    AgentAttentionReason, AgentState, AttachFrame, ShellSnapshot, ShellSpec, ShellStatus,
+    TerminalProfile,
 };
 use compact_str::CompactString;
-use gpui::Keystroke;
+use gpui::{Keystroke, Modifiers};
+use libghostty_vt::key::{
+    Action as KeyAction, Encoder as KeyEncoder, Event as KeyEvent, Key as GhosttyKey,
+    Mods as GhosttyMods,
+};
 use libghostty_vt::kitty::graphics::{ImageFormat, PlacementIterator};
+use libghostty_vt::mouse::{
+    Action as MouseAction, Button as MouseButton, Encoder as MouseEncoder, EncoderSize,
+    Event as MouseEvent, Position as MousePosition,
+};
 use libghostty_vt::render::{CellIterator, RowIterator};
 use libghostty_vt::screen::CellWide;
 use libghostty_vt::style::{Palette, PaletteIndex, RgbColor, Underline};
@@ -21,6 +30,7 @@ use libghostty_vt::terminal::{Mode, ScrollViewport};
 use libghostty_vt::{RenderState, Terminal as GhosttyTerminal, TerminalOptions};
 
 use crate::generated_names;
+use crate::theme::TerminalTheme;
 
 const SCROLLBACK_ROWS: usize = 2_000;
 const RECONNECT_ATTEMPTS: usize = 80;
@@ -67,6 +77,8 @@ pub struct AgentChoice {
     pub state: AgentState,
     pub updated_at_ms: u64,
     pub needs_attention: bool,
+    pub completed_attention: bool,
+    pub attention_revision: Option<u64>,
 }
 
 impl AgentChoice {
@@ -150,15 +162,17 @@ struct SharedTerminal {
     profile: Mutex<TerminalProfile>,
     status: Mutex<String>,
     revision: AtomicU64,
-    application_cursor: AtomicBool,
     bracketed_paste: AtomicBool,
+    mouse_tracking: AtomicBool,
     pending_scroll_row: AtomicU64,
     pending_scroll_wakeup: AtomicBool,
+    pending_theme: Mutex<Option<TerminalTheme>>,
     closed: AtomicBool,
 }
 
 impl SharedTerminal {
     fn new(profile: TerminalProfile) -> Self {
+        let theme = crate::theme::current_terminal();
         let (updates, update_events) = async_channel::bounded(1);
         Self {
             screen: Mutex::new(Arc::new(blank_screen(profile.rows, profile.cols))),
@@ -169,10 +183,11 @@ impl SharedTerminal {
             profile: Mutex::new(profile),
             status: Mutex::new("connecting".into()),
             revision: AtomicU64::new(1),
-            application_cursor: AtomicBool::new(false),
             bracketed_paste: AtomicBool::new(false),
+            mouse_tracking: AtomicBool::new(false),
             pending_scroll_row: AtomicU64::new(0),
             pending_scroll_wakeup: AtomicBool::new(false),
+            pending_theme: Mutex::new(Some(theme)),
             closed: AtomicBool::new(false),
         }
     }
@@ -189,6 +204,41 @@ impl SharedTerminal {
             .ok_or_else(|| "Ghostty terminal core is not running".to_string())?
             .send(command)
             .map_err(|_| "Ghostty terminal core stopped".to_string())
+    }
+
+    fn try_emulator_command(&self, command: EmulatorCommand) -> Result<(), String> {
+        let emulator = self.emulator.lock().unwrap();
+        let sender = emulator
+            .as_ref()
+            .ok_or_else(|| "Ghostty terminal core is not running".to_string())?;
+        match sender.try_send(command) {
+            Ok(()) | Err(mpsc::TrySendError::Full(_)) => Ok(()),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err("Ghostty terminal core stopped".into()),
+        }
+    }
+
+    fn try_key_command(&self, keystroke: Keystroke, action: KeyAction) -> Result<(), String> {
+        let emulator = self.emulator.lock().unwrap();
+        let sender = emulator
+            .as_ref()
+            .ok_or_else(|| "Ghostty terminal core is not running".to_string())?;
+        match sender.try_send(EmulatorCommand::Key { keystroke, action }) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => Err("terminal input queue is full".into()),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err("Ghostty terminal core stopped".into()),
+        }
+    }
+
+    fn set_theme(&self, theme: TerminalTheme) -> Result<(), String> {
+        *self.pending_theme.lock().unwrap() = Some(theme);
+        let emulator = self.emulator.lock().unwrap();
+        let sender = emulator
+            .as_ref()
+            .ok_or_else(|| "Ghostty terminal core is not running".to_string())?;
+        match sender.try_send(EmulatorCommand::ThemeLatest) {
+            Ok(()) | Err(mpsc::TrySendError::Full(_)) => Ok(()),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err("Ghostty terminal core stopped".into()),
+        }
     }
 
     fn scroll_to_row(&self, row: usize) -> Result<(), String> {
@@ -223,6 +273,7 @@ impl SharedTerminal {
         }
     }
 
+    #[cfg(test)]
     fn viewport_is_at_bottom(&self) -> bool {
         let screen = self.screen.lock().unwrap();
         screen.scroll_offset >= screen.scroll_total.saturating_sub(screen.scroll_len)
@@ -293,6 +344,10 @@ impl SharedTerminal {
 
 enum EmulatorCommand {
     Output(Vec<u8>),
+    Key {
+        keystroke: Keystroke,
+        action: KeyAction,
+    },
     Resize {
         rows: u16,
         cols: u16,
@@ -301,6 +356,15 @@ enum EmulatorCommand {
     },
     Scroll(ScrollViewport),
     ScrollLatest,
+    ThemeLatest,
+    MouseWheel {
+        lines: isize,
+        x: f32,
+        y: f32,
+        screen_width: u32,
+        screen_height: u32,
+        modifiers: Modifiers,
+    },
     Stop,
 }
 
@@ -363,6 +427,10 @@ impl TerminalSession {
         self.shared.revision.load(Ordering::Acquire)
     }
 
+    pub fn set_theme(&self, theme: TerminalTheme) -> Result<(), String> {
+        self.shared.set_theme(theme)
+    }
+
     pub fn is_closed(&self) -> bool {
         self.shared.closed.load(Ordering::Acquire)
     }
@@ -388,21 +456,11 @@ impl TerminalSession {
         self.shared.update_events.clone()
     }
 
-    pub fn send_key(&self, keystroke: &Keystroke) -> bool {
-        let application_cursor = self.shared.application_cursor.load(Ordering::Acquire);
-        let Some(bytes) = encode_key(keystroke, application_cursor) else {
+    pub fn send_key(&self, keystroke: &Keystroke, action: KeyAction) -> bool {
+        if !terminal_key_supported(keystroke) {
             return false;
-        };
-        // Typing follows conventional terminal behavior and returns the
-        // viewport to the live prompt before the PTY produces more output.
-        if !self.shared.viewport_is_at_bottom()
-            && let Err(error) = self
-                .shared
-                .emulator_command(EmulatorCommand::Scroll(ScrollViewport::Bottom))
-        {
-            self.shared.set_status(error);
         }
-        if let Err(error) = self.shared.send(AttachFrame::Input(bytes)) {
+        if let Err(error) = self.shared.try_key_command(keystroke.clone(), action) {
             self.shared.set_status(error);
         }
         true
@@ -426,6 +484,32 @@ impl TerminalSession {
         if let Err(error) = self
             .shared
             .emulator_command(EmulatorCommand::Scroll(ScrollViewport::Delta(lines)))
+        {
+            self.shared.set_status(error);
+        }
+        true
+    }
+
+    pub fn report_mouse_wheel(
+        &self,
+        lines: isize,
+        position: (f32, f32),
+        screen_size: (u32, u32),
+        modifiers: Modifiers,
+    ) -> bool {
+        if lines == 0 || !self.shared.mouse_tracking.load(Ordering::Acquire) {
+            return false;
+        }
+        if let Err(error) = self
+            .shared
+            .try_emulator_command(EmulatorCommand::MouseWheel {
+                lines: lines.clamp(-32, 32),
+                x: position.0,
+                y: position.1,
+                screen_width: screen_size.0,
+                screen_height: screen_size.1,
+                modifiers,
+            })
         {
             self.shared.set_status(error);
         }
@@ -548,6 +632,18 @@ pub fn discover_overview() -> Result<BoomuxOverview, String> {
         });
         let agent_count = visible_agents.clone().count();
         agents.extend(visible_agents.map(|agent| {
+            let attention_revision = agent
+                .attention
+                .as_ref()
+                .map(|attention| attention.observation.revision);
+            let completed_attention = agent
+                .attention
+                .as_ref()
+                .is_some_and(|attention| attention.reason == AgentAttentionReason::Completed);
+            let needs_attention = agent
+                .attention
+                .as_ref()
+                .is_some_and(|attention| attention.reason == AgentAttentionReason::Blocked);
             AgentChoice {
                 id: agent.id.clone(),
                 shell_name: workspace
@@ -560,8 +656,18 @@ pub fn discover_overview() -> Result<BoomuxOverview, String> {
                 shell_id: agent.shell_id.clone(),
                 integration: agent.integration.clone(),
                 state: agent.observation.state,
-                updated_at_ms: agent.observation.observed_at_ms,
-                needs_attention: agent.attention.is_some(),
+                updated_at_ms: agent.attention.as_ref().map_or(
+                    agent.observation.observed_at_ms,
+                    |attention| {
+                        agent
+                            .observation
+                            .observed_at_ms
+                            .max(attention.observation.observed_at_ms)
+                    },
+                ),
+                needs_attention,
+                completed_attention,
+                attention_revision,
             }
         }));
         workspaces.push(WorkspaceChoice {
@@ -577,6 +683,21 @@ pub fn discover_overview() -> Result<BoomuxOverview, String> {
         agents,
         focused_shell_id,
     })
+}
+
+pub fn acknowledge_agent_attention(
+    agent_id: &str,
+    observation_revision: u64,
+) -> Result<(), String> {
+    let Some(client) = client::connect_if_running()
+        .map_err(|error| format!("could not connect to Boomux: {error}"))?
+    else {
+        return Err("Boomux is not running".into());
+    };
+    client
+        .acknowledge_agent_attention(agent_id, observation_revision)
+        .map(|_| ())
+        .map_err(|error| format!("could not acknowledge Agent notification: {error}"))
 }
 
 fn agent_is_visible(state: AgentState, has_attention: bool, attached_to_current_run: bool) -> bool {
@@ -765,6 +886,8 @@ struct EmulatorCore {
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
     graphics: PlacementIterator<'static>,
+    key: KeyEncoder<'static>,
+    mouse: MouseEncoder<'static>,
     previous_images: Vec<TerminalImage>,
     cell_width: u32,
     cell_height: u32,
@@ -786,7 +909,13 @@ impl EmulatorCore {
             max_scrollback: SCROLLBACK_ROWS,
         })
         .map_err(|error| format!("could not create Ghostty terminal: {error}"))?;
-        configure_terminal(&mut terminal)?;
+        let theme = shared
+            .pending_theme
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| "terminal theme was not initialized".to_string())?;
+        configure_terminal(&mut terminal, theme)?;
         terminal
             .set_kitty_image_storage_limit(KITTY_IMAGE_STORAGE_BYTES)
             .map_err(|error| format!("could not enable Ghostty Kitty graphics: {error}"))?;
@@ -817,6 +946,10 @@ impl EmulatorCore {
                 .map_err(|error| format!("could not create Ghostty cell iterator: {error}"))?,
             graphics: PlacementIterator::new()
                 .map_err(|error| format!("could not create Ghostty graphics iterator: {error}"))?,
+            key: KeyEncoder::new()
+                .map_err(|error| format!("could not create Ghostty key encoder: {error}"))?,
+            mouse: MouseEncoder::new()
+                .map_err(|error| format!("could not create Ghostty mouse encoder: {error}"))?,
             previous_images: Vec::new(),
             cell_width,
             cell_height,
@@ -826,6 +959,9 @@ impl EmulatorCore {
     fn apply(&mut self, command: EmulatorCommand) -> Result<bool, String> {
         match command {
             EmulatorCommand::Output(bytes) => self.terminal.vt_write(&bytes),
+            EmulatorCommand::Key { .. } => {
+                unreachable!("key events are resolved by the emulator worker")
+            }
             EmulatorCommand::Resize {
                 rows,
                 cols,
@@ -841,6 +977,12 @@ impl EmulatorCore {
             EmulatorCommand::Scroll(viewport) => self.terminal.scroll_viewport(viewport),
             EmulatorCommand::ScrollLatest => {
                 unreachable!("latest scroll requests are resolved by the emulator worker")
+            }
+            EmulatorCommand::ThemeLatest => {
+                unreachable!("latest theme requests are resolved by the emulator worker")
+            }
+            EmulatorCommand::MouseWheel { .. } => {
+                unreachable!("mouse events are resolved by the emulator worker")
             }
             EmulatorCommand::Stop => return Ok(false),
         }
@@ -957,13 +1099,113 @@ fn apply_emulator_command(
     command: EmulatorCommand,
 ) -> Result<bool, String> {
     match command {
+        EmulatorCommand::Key { keystroke, action } => {
+            // Typing follows conventional terminal behavior and returns the
+            // viewport to the live prompt before the PTY produces more output.
+            if action != KeyAction::Release {
+                core.terminal.scroll_viewport(ScrollViewport::Bottom);
+            }
+            let bytes = encode_key(&core.terminal, &mut core.key, &keystroke, action)?;
+            if !bytes.is_empty() {
+                shared.send(AttachFrame::Input(bytes))?;
+            }
+            Ok(true)
+        }
         EmulatorCommand::ScrollLatest => {
             shared.pending_scroll_wakeup.store(false, Ordering::Release);
             let row = shared.pending_scroll_row.load(Ordering::Acquire) as usize;
             core.apply(EmulatorCommand::Scroll(ScrollViewport::Row(row)))
         }
+        EmulatorCommand::ThemeLatest => {
+            if let Some(theme) = shared.pending_theme.lock().unwrap().take() {
+                configure_terminal(&mut core.terminal, theme)?;
+            }
+            Ok(true)
+        }
+        EmulatorCommand::MouseWheel {
+            lines,
+            x,
+            y,
+            screen_width,
+            screen_height,
+            modifiers,
+        } => {
+            let bytes = encode_mouse_wheel(
+                &core.terminal,
+                &mut core.mouse,
+                lines,
+                (x, y),
+                (screen_width, screen_height),
+                core.cell_width,
+                core.cell_height,
+                modifiers,
+            )?;
+            if !bytes.is_empty() {
+                shared.send(AttachFrame::Input(bytes))?;
+            }
+            Ok(true)
+        }
         command => core.apply(command),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_mouse_wheel(
+    terminal: &GhosttyTerminal<'_, '_>,
+    encoder: &mut MouseEncoder<'_>,
+    lines: isize,
+    position: (f32, f32),
+    screen_size: (u32, u32),
+    cell_width: u32,
+    cell_height: u32,
+    modifiers: Modifiers,
+) -> Result<Vec<u8>, String> {
+    if lines == 0
+        || !terminal
+            .is_mouse_tracking()
+            .map_err(|error| format!("could not read Ghostty mouse mode: {error}"))?
+    {
+        return Ok(Vec::new());
+    }
+    let mut mods = GhosttyMods::empty();
+    mods.set(GhosttyMods::SHIFT, modifiers.shift);
+    mods.set(GhosttyMods::ALT, modifiers.alt);
+    mods.set(GhosttyMods::CTRL, modifiers.control);
+    mods.set(GhosttyMods::SUPER, modifiers.platform);
+    let (screen_width, screen_height) = screen_size;
+    encoder
+        .set_options_from_terminal(terminal)
+        .set_size(EncoderSize {
+            screen_width,
+            screen_height,
+            cell_width,
+            cell_height,
+            padding_top: 8,
+            padding_bottom: 8,
+            padding_right: 8,
+            padding_left: 8,
+        });
+    let mut event = MouseEvent::new()
+        .map_err(|error| format!("could not create Ghostty mouse event: {error}"))?;
+    event
+        .set_action(MouseAction::Press)
+        .set_button(Some(if lines > 0 {
+            MouseButton::Four
+        } else {
+            MouseButton::Five
+        }))
+        .set_mods(mods)
+        .set_position(MousePosition {
+            x: position.0,
+            y: position.1,
+        });
+    let mut bytes = Vec::with_capacity(lines.unsigned_abs().min(32) * 16);
+    for _ in 0..lines.unsigned_abs().min(32) {
+        encoder
+            .encode_to_vec(&event, &mut bytes)
+            .map_err(|error| format!("could not encode Ghostty mouse wheel: {error}"))?;
+    }
+    Ok(bytes)
 }
 
 fn terminal_images(
@@ -1170,6 +1412,12 @@ fn start_emulator(
                         return;
                     }
                 }
+                if let Some(theme) = worker_shared.pending_theme.lock().unwrap().take()
+                    && let Err(error) = configure_terminal(&mut core.terminal, theme)
+                {
+                    worker_shared.close(error);
+                    return;
+                }
                 if core.terminal.mode(Mode::SYNC_OUTPUT).unwrap_or(false) {
                     continue;
                 }
@@ -1190,14 +1438,7 @@ fn start_emulator(
 
 fn publish_screen(core: &mut EmulatorCore, shared: &SharedTerminal) -> Result<(), String> {
     let screen = core.screen()?;
-    let application_cursor = core
-        .terminal
-        .mode(Mode::DECCKM)
-        .map_err(|error| format!("could not read Ghostty cursor mode: {error}"))?;
     *shared.screen.lock().unwrap() = Arc::new(screen);
-    shared
-        .application_cursor
-        .store(application_cursor, Ordering::Release);
     let bracketed_paste = core
         .terminal
         .mode(Mode::BRACKETED_PASTE)
@@ -1205,33 +1446,47 @@ fn publish_screen(core: &mut EmulatorCore, shared: &SharedTerminal) -> Result<()
     shared
         .bracketed_paste
         .store(bracketed_paste, Ordering::Release);
+    let mouse_tracking = core
+        .terminal
+        .is_mouse_tracking()
+        .map_err(|error| format!("could not read Ghostty mouse mode: {error}"))?;
+    shared
+        .mouse_tracking
+        .store(mouse_tracking, Ordering::Release);
     shared.bump_revision();
     Ok(())
 }
 
-fn configure_terminal(terminal: &mut GhosttyTerminal<'_, '_>) -> Result<(), String> {
+fn configure_terminal(
+    terminal: &mut GhosttyTerminal<'_, '_>,
+    theme: TerminalTheme,
+) -> Result<(), String> {
     let mut palette = Palette::default();
     for index in 0..=u8::MAX {
-        palette.set(PaletteIndex(index), rgb_color(indexed_color(index)));
+        palette.set(
+            PaletteIndex(index),
+            rgb_color(indexed_color_with_palette(index, &theme.ansi)),
+        );
     }
     terminal
-        .set_default_fg_color(Some(rgb_color(DEFAULT_FOREGROUND)))
-        .and_then(|terminal| terminal.set_default_bg_color(Some(rgb_color(DEFAULT_BACKGROUND))))
-        .and_then(|terminal| terminal.set_default_cursor_color(Some(rgb_color(DEFAULT_FOREGROUND))))
+        .set_default_fg_color(Some(rgb_color(theme.foreground)))
+        .and_then(|terminal| terminal.set_default_bg_color(Some(rgb_color(theme.background))))
+        .and_then(|terminal| terminal.set_default_cursor_color(Some(rgb_color(theme.cursor))))
         .and_then(|terminal| terminal.set_default_color_palette(Some(palette)))
         .map_err(|error| format!("could not configure Ghostty colors: {error}"))?;
     Ok(())
 }
 
 fn blank_screen(rows: u16, cols: u16) -> TerminalScreen {
+    let theme = crate::theme::current_terminal();
     TerminalScreen {
         rows,
         cols,
         cells: vec![
             TerminalCell {
                 text: " ".into(),
-                foreground: DEFAULT_FOREGROUND,
-                background: DEFAULT_BACKGROUND,
+                foreground: theme.foreground,
+                background: theme.background,
                 bold: false,
                 italic: false,
                 underline: false,
@@ -1252,13 +1507,6 @@ fn blank_screen(rows: u16, cols: u16) -> TerminalScreen {
 fn cell_dimension(pixels: u16, cells: u16) -> u32 {
     u32::from(pixels / cells.max(1)).max(1)
 }
-
-const DEFAULT_FOREGROUND: u32 = 0xcdd6f4;
-const DEFAULT_BACKGROUND: u32 = 0x11111b;
-const ANSI_COLORS: [u32; 16] = [
-    0x1e1e2e, 0xf38ba8, 0xa6e3a1, 0xf9e2af, 0x89b4fa, 0xf5c2e7, 0x94e2d5, 0xcdd6f4, 0x45475a,
-    0xf38ba8, 0xa6e3a1, 0xf9e2af, 0x89b4fa, 0xf5c2e7, 0x94e2d5, 0xffffff,
-];
 
 fn rgb_color(value: u32) -> RgbColor {
     RgbColor {
@@ -1407,55 +1655,232 @@ fn reconnect(
     ))
 }
 
-fn encode_key(keystroke: &Keystroke, application_cursor: bool) -> Option<Vec<u8>> {
-    let modifiers = keystroke.modifiers;
-    if modifiers.platform || modifiers.function {
-        return None;
+fn encode_key(
+    terminal: &GhosttyTerminal<'_, '_>,
+    encoder: &mut KeyEncoder<'_>,
+    keystroke: &Keystroke,
+    action: KeyAction,
+) -> Result<Vec<u8>, String> {
+    // Boomux's terminal reconstruction does not currently preserve Kitty
+    // keyboard flags. An enhanced TUI reattached after its negotiation can
+    // therefore receive modifyOtherKeys for Shift+Enter even though it expects
+    // Kitty CSI-u. LF is the portable Ctrl+J spelling that Codex and other
+    // readline-style editors already treat as an inserted newline. It is also
+    // harmless in applications that do not distinguish Shift+Enter.
+    if keystroke.key == "enter"
+        && keystroke.modifiers.shift
+        && !keystroke.modifiers.control
+        && !keystroke.modifiers.alt
+        && !keystroke.modifiers.platform
+    {
+        return Ok(if matches!(action, KeyAction::Press | KeyAction::Repeat) {
+            b"\n".to_vec()
+        } else {
+            Vec::new()
+        });
     }
 
-    let special = match keystroke.key.as_str() {
-        "enter" => Some(b"\r".as_slice()),
-        "backspace" => Some(b"\x7f".as_slice()),
-        "tab" if modifiers.shift => Some(b"\x1b[Z".as_slice()),
-        "tab" => Some(b"\t".as_slice()),
-        "escape" => Some(b"\x1b".as_slice()),
-        "up" if application_cursor => Some(b"\x1bOA".as_slice()),
-        "down" if application_cursor => Some(b"\x1bOB".as_slice()),
-        "right" if application_cursor => Some(b"\x1bOC".as_slice()),
-        "left" if application_cursor => Some(b"\x1bOD".as_slice()),
-        "up" => Some(b"\x1b[A".as_slice()),
-        "down" => Some(b"\x1b[B".as_slice()),
-        "right" => Some(b"\x1b[C".as_slice()),
-        "left" => Some(b"\x1b[D".as_slice()),
-        "home" => Some(b"\x1b[H".as_slice()),
-        "end" => Some(b"\x1b[F".as_slice()),
-        "delete" => Some(b"\x1b[3~".as_slice()),
-        "pageup" => Some(b"\x1b[5~".as_slice()),
-        "pagedown" => Some(b"\x1b[6~".as_slice()),
-        _ => None,
-    };
+    let (unshifted_key, implied_shift) = unshifted_key(&keystroke.key);
+    let key = ghostty_key(unshifted_key).unwrap_or(GhosttyKey::Unidentified);
+    let text = keystroke
+        .key_char
+        .as_deref()
+        .filter(|text| valid_key_text(text));
+    let mut mods = GhosttyMods::empty();
+    mods.set(
+        GhosttyMods::SHIFT,
+        keystroke.modifiers.shift || implied_shift,
+    );
+    mods.set(GhosttyMods::ALT, keystroke.modifiers.alt);
+    mods.set(GhosttyMods::CTRL, keystroke.modifiers.control);
+    mods.set(GhosttyMods::SUPER, keystroke.modifiers.platform);
+    let mut consumed_mods = GhosttyMods::empty();
+    consumed_mods.set(
+        GhosttyMods::SHIFT,
+        text.is_some() && mods.contains(GhosttyMods::SHIFT),
+    );
 
-    let mut bytes = if let Some(special) = special {
-        special.to_vec()
-    } else if modifiers.control {
-        let byte = keystroke.key.as_bytes().first().copied()?;
-        if !byte.is_ascii() {
-            return None;
-        }
-        vec![byte.to_ascii_uppercase() & 0x1f]
-    } else {
-        keystroke.key_char.as_ref()?.as_bytes().to_vec()
-    };
-
-    if modifiers.alt {
-        bytes.insert(0, 0x1b);
+    let mut event =
+        KeyEvent::new().map_err(|error| format!("could not create Ghostty key event: {error}"))?;
+    event
+        .set_action(action)
+        .set_key(key)
+        .set_mods(mods)
+        .set_consumed_mods(consumed_mods);
+    if let Some(text) = text {
+        event.set_utf8(Some(text));
     }
-    Some(bytes)
+    if let Some(unshifted) = unshifted_codepoint(unshifted_key) {
+        event.set_unshifted_codepoint(unshifted);
+    }
+
+    encoder.set_options_from_terminal(terminal);
+    let mut output = [0_u8; 128];
+    let written = encoder
+        .encode(&event, &mut output)
+        .map_err(|error| format!("could not encode Ghostty key event: {error}"))?;
+    Ok(output[..written].to_vec())
 }
 
+fn terminal_key_supported(keystroke: &Keystroke) -> bool {
+    !keystroke.modifiers.function
+        && (ghostty_key(unshifted_key(&keystroke.key).0).is_some()
+            || keystroke.key_char.as_deref().is_some_and(valid_key_text))
+}
+
+fn valid_key_text(text: &str) -> bool {
+    !text.is_empty()
+        && !text.chars().any(|character| {
+            character.is_control() || ('\u{f700}'..='\u{f8ff}').contains(&character)
+        })
+}
+
+fn unshifted_key(key: &str) -> (&str, bool) {
+    match key {
+        "!" => ("1", true),
+        "@" => ("2", true),
+        "#" => ("3", true),
+        "$" => ("4", true),
+        "%" => ("5", true),
+        "^" => ("6", true),
+        "&" => ("7", true),
+        "*" => ("8", true),
+        "(" => ("9", true),
+        ")" => ("0", true),
+        "_" => ("-", true),
+        "+" => ("=", true),
+        "{" => ("[", true),
+        "}" => ("]", true),
+        "|" => ("\\", true),
+        ":" => (";", true),
+        "\"" => ("'", true),
+        "<" => (",", true),
+        ">" => (".", true),
+        "?" => ("/", true),
+        "~" => ("`", true),
+        _ => (key, false),
+    }
+}
+
+fn unshifted_codepoint(key: &str) -> Option<char> {
+    if key == "space" {
+        return Some(' ');
+    }
+    let mut characters = key.chars();
+    let character = characters.next()?;
+    characters.next().is_none().then_some(character)
+}
+
+fn ghostty_key(key: &str) -> Option<GhosttyKey> {
+    Some(match key {
+        "`" => GhosttyKey::Backquote,
+        "\\" => GhosttyKey::Backslash,
+        "[" => GhosttyKey::BracketLeft,
+        "]" => GhosttyKey::BracketRight,
+        "," => GhosttyKey::Comma,
+        "0" => GhosttyKey::Digit0,
+        "1" => GhosttyKey::Digit1,
+        "2" => GhosttyKey::Digit2,
+        "3" => GhosttyKey::Digit3,
+        "4" => GhosttyKey::Digit4,
+        "5" => GhosttyKey::Digit5,
+        "6" => GhosttyKey::Digit6,
+        "7" => GhosttyKey::Digit7,
+        "8" => GhosttyKey::Digit8,
+        "9" => GhosttyKey::Digit9,
+        "=" => GhosttyKey::Equal,
+        "a" => GhosttyKey::A,
+        "b" => GhosttyKey::B,
+        "c" => GhosttyKey::C,
+        "d" => GhosttyKey::D,
+        "e" => GhosttyKey::E,
+        "f" => GhosttyKey::F,
+        "g" => GhosttyKey::G,
+        "h" => GhosttyKey::H,
+        "i" => GhosttyKey::I,
+        "j" => GhosttyKey::J,
+        "k" => GhosttyKey::K,
+        "l" => GhosttyKey::L,
+        "m" => GhosttyKey::M,
+        "n" => GhosttyKey::N,
+        "o" => GhosttyKey::O,
+        "p" => GhosttyKey::P,
+        "q" => GhosttyKey::Q,
+        "r" => GhosttyKey::R,
+        "s" => GhosttyKey::S,
+        "t" => GhosttyKey::T,
+        "u" => GhosttyKey::U,
+        "v" => GhosttyKey::V,
+        "w" => GhosttyKey::W,
+        "x" => GhosttyKey::X,
+        "y" => GhosttyKey::Y,
+        "z" => GhosttyKey::Z,
+        "-" => GhosttyKey::Minus,
+        "." => GhosttyKey::Period,
+        "'" => GhosttyKey::Quote,
+        ";" => GhosttyKey::Semicolon,
+        "/" => GhosttyKey::Slash,
+        "backspace" => GhosttyKey::Backspace,
+        "enter" | "return" => GhosttyKey::Enter,
+        "space" => GhosttyKey::Space,
+        "tab" => GhosttyKey::Tab,
+        "delete" => GhosttyKey::Delete,
+        "end" => GhosttyKey::End,
+        "home" => GhosttyKey::Home,
+        "insert" => GhosttyKey::Insert,
+        "pagedown" | "page_down" | "page-down" => GhosttyKey::PageDown,
+        "pageup" | "page_up" | "page-up" => GhosttyKey::PageUp,
+        "down" => GhosttyKey::ArrowDown,
+        "left" => GhosttyKey::ArrowLeft,
+        "right" => GhosttyKey::ArrowRight,
+        "up" => GhosttyKey::ArrowUp,
+        "add" => GhosttyKey::NumpadAdd,
+        "begin" => GhosttyKey::NumpadBegin,
+        "clear" => GhosttyKey::NumpadClear,
+        "decimal" => GhosttyKey::NumpadDecimal,
+        "divide" => GhosttyKey::NumpadDivide,
+        "equal" => GhosttyKey::NumpadEqual,
+        "multiply" => GhosttyKey::NumpadMultiply,
+        "separator" => GhosttyKey::NumpadSeparator,
+        "subtract" => GhosttyKey::NumpadSubtract,
+        "escape" => GhosttyKey::Escape,
+        "f1" => GhosttyKey::F1,
+        "f2" => GhosttyKey::F2,
+        "f3" => GhosttyKey::F3,
+        "f4" => GhosttyKey::F4,
+        "f5" => GhosttyKey::F5,
+        "f6" => GhosttyKey::F6,
+        "f7" => GhosttyKey::F7,
+        "f8" => GhosttyKey::F8,
+        "f9" => GhosttyKey::F9,
+        "f10" => GhosttyKey::F10,
+        "f11" => GhosttyKey::F11,
+        "f12" => GhosttyKey::F12,
+        "f13" => GhosttyKey::F13,
+        "f14" => GhosttyKey::F14,
+        "f15" => GhosttyKey::F15,
+        "f16" => GhosttyKey::F16,
+        "f17" => GhosttyKey::F17,
+        "f18" => GhosttyKey::F18,
+        "f19" => GhosttyKey::F19,
+        "f20" => GhosttyKey::F20,
+        "f21" => GhosttyKey::F21,
+        "f22" => GhosttyKey::F22,
+        "f23" => GhosttyKey::F23,
+        "f24" => GhosttyKey::F24,
+        "f25" => GhosttyKey::F25,
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
 fn indexed_color(index: u8) -> u32 {
+    indexed_color_with_palette(index, &crate::theme::current_terminal().ansi)
+}
+
+fn indexed_color_with_palette(index: u8, ansi: &[u32; 16]) -> u32 {
     match index {
-        0..=15 => ANSI_COLORS[usize::from(index)],
+        0..=15 => ansi[usize::from(index)],
         16..=231 => {
             let value = index - 16;
             let component = |part: u8| if part == 0 { 0 } else { 55 + part * 40 };
@@ -1480,12 +1905,15 @@ mod tests {
 
     use boomux::protocol::{AgentState, AttachFrame};
     use gpui::{Keystroke, Modifiers};
+    use libghostty_vt::key::Action as KeyAction;
     use libghostty_vt::terminal::Mode;
 
     use super::{
-        EmulatorCommand, EmulatorCore, SharedTerminal, agent_is_visible, blank_screen, encode_key,
-        encode_paste, image_bgra, indexed_color, resynchronize_terminal_size, terminal_profile,
+        EmulatorCommand, EmulatorCore, SharedTerminal, agent_is_visible, blank_screen,
+        configure_terminal, encode_key, encode_mouse_wheel, encode_paste, image_bgra,
+        indexed_color, resynchronize_terminal_size, terminal_profile,
     };
+    use crate::theme::TerminalTheme;
     use std::sync::Arc;
 
     fn key(key: &str, key_char: Option<&str>, modifiers: Modifiers) -> Keystroke {
@@ -1532,6 +1960,57 @@ mod tests {
     }
 
     #[test]
+    fn terminal_key_submission_is_bounded_and_nonblocking() {
+        let shared = SharedTerminal::new(terminal_profile(24, 80, 800, 480));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        shared.install_emulator(sender);
+        shared
+            .emulator_command(EmulatorCommand::Output(Vec::new()))
+            .unwrap();
+
+        assert_eq!(
+            shared
+                .try_key_command(key("a", Some("a"), Modifiers::default()), KeyAction::Press,)
+                .unwrap_err(),
+            "terminal input queue is full"
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(EmulatorCommand::Output(_))
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn terminal_theme_requests_are_bounded_and_keep_the_latest_palette() {
+        let shared = SharedTerminal::new(terminal_profile(24, 80, 800, 480));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        shared.install_emulator(sender);
+        let first = TerminalTheme {
+            foreground: 0x111111,
+            background: 0x222222,
+            cursor: 0x333333,
+            ansi: [0x444444; 16],
+        };
+        let latest = TerminalTheme {
+            foreground: 0xaaaaaa,
+            background: 0xbbbbbb,
+            cursor: 0xcccccc,
+            ansi: [0xdddddd; 16],
+        };
+
+        shared.set_theme(first).unwrap();
+        shared.set_theme(latest).unwrap();
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(EmulatorCommand::ThemeLatest)
+        ));
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(*shared.pending_theme.lock().unwrap(), Some(latest));
+    }
+
+    #[test]
     fn terminal_update_events_are_bounded_and_coalesced() {
         let shared = SharedTerminal::new(terminal_profile(24, 80, 800, 480));
         let events = shared.update_events.clone();
@@ -1561,13 +2040,29 @@ mod tests {
     }
 
     #[test]
-    fn encodes_text_control_and_cursor_keys() {
+    fn encodes_legacy_text_control_and_negotiated_cursor_keys() {
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(24, 80, 800, 480)));
+        let mut core = EmulatorCore::new(&shared, 24, 80, 800, 480).unwrap();
+        let EmulatorCore {
+            terminal,
+            key: encoder,
+            ..
+        } = &mut core;
+
         assert_eq!(
-            encode_key(&key("a", Some("a"), Modifiers::default()), false),
-            Some(b"a".to_vec())
+            encode_key(
+                terminal,
+                encoder,
+                &key("a", Some("a"), Modifiers::default()),
+                KeyAction::Press,
+            )
+            .unwrap(),
+            b"a"
         );
         assert_eq!(
             encode_key(
+                terminal,
+                encoder,
                 &key(
                     "c",
                     None,
@@ -1576,13 +2071,187 @@ mod tests {
                         ..Default::default()
                     }
                 ),
-                false
+                KeyAction::Press,
             ),
-            Some(vec![3])
+            Ok(vec![3])
         );
         assert_eq!(
-            encode_key(&key("up", None, Modifiers::default()), true),
-            Some(b"\x1bOA".to_vec())
+            encode_key(
+                terminal,
+                encoder,
+                &key(
+                    "a",
+                    Some("a"),
+                    Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                ),
+                KeyAction::Press,
+            )
+            .unwrap(),
+            b"\x1ba"
+        );
+        assert_eq!(
+            encode_key(
+                terminal,
+                encoder,
+                &key("!", Some("!"), Modifiers::default()),
+                KeyAction::Press,
+            )
+            .unwrap(),
+            b"!"
+        );
+        assert_eq!(
+            encode_key(
+                terminal,
+                encoder,
+                &key("é", Some("é"), Modifiers::default()),
+                KeyAction::Press,
+            )
+            .unwrap(),
+            "é".as_bytes()
+        );
+        assert_eq!(
+            encode_key(
+                terminal,
+                encoder,
+                &key("up", None, Modifiers::default()),
+                KeyAction::Press,
+            )
+            .unwrap(),
+            b"\x1b[A"
+        );
+        terminal.vt_write(b"\x1b[?1h");
+        assert_eq!(
+            encode_key(
+                terminal,
+                encoder,
+                &key("up", None, Modifiers::default()),
+                KeyAction::Press,
+            )
+            .unwrap(),
+            b"\x1bOA"
+        );
+        assert_eq!(
+            encode_key(
+                terminal,
+                encoder,
+                &key(
+                    "up",
+                    None,
+                    Modifiers {
+                        control: true,
+                        ..Default::default()
+                    },
+                ),
+                KeyAction::Press,
+            )
+            .unwrap(),
+            b"\x1b[1;5A"
+        );
+        assert_eq!(
+            encode_key(
+                terminal,
+                encoder,
+                &key("f5", None, Modifiers::default()),
+                KeyAction::Press,
+            )
+            .unwrap(),
+            b"\x1b[15~"
+        );
+        assert_eq!(
+            encode_key(
+                terminal,
+                encoder,
+                &key("add", Some("+"), Modifiers::default()),
+                KeyAction::Press,
+            )
+            .unwrap(),
+            b"+"
+        );
+        terminal.vt_write(b"\x1b[?1035l\x1b[?66h");
+        assert_eq!(
+            encode_key(
+                terminal,
+                encoder,
+                &key("add", Some("+"), Modifiers::default()),
+                KeyAction::Press,
+            )
+            .unwrap(),
+            b"\x1bOk"
+        );
+        assert_eq!(
+            encode_key(
+                terminal,
+                encoder,
+                &key(
+                    "tab",
+                    None,
+                    Modifiers {
+                        shift: true,
+                        ..Default::default()
+                    },
+                ),
+                KeyAction::Press,
+            )
+            .unwrap(),
+            b"\x1b[Z"
+        );
+    }
+
+    #[test]
+    fn shift_enter_inserts_a_newline_across_keyboard_modes() {
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(24, 80, 800, 480)));
+        let mut core = EmulatorCore::new(&shared, 24, 80, 800, 480).unwrap();
+        let EmulatorCore {
+            terminal,
+            key: encoder,
+            ..
+        } = &mut core;
+        let enter = key("enter", None, Modifiers::default());
+        let shift_enter = key(
+            "enter",
+            None,
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            encode_key(terminal, encoder, &enter, KeyAction::Press).unwrap(),
+            b"\r"
+        );
+        assert_eq!(
+            encode_key(terminal, encoder, &shift_enter, KeyAction::Press).unwrap(),
+            b"\n"
+        );
+
+        terminal.vt_write(b"\x1b[>1u");
+        assert_eq!(
+            encode_key(terminal, encoder, &enter, KeyAction::Press).unwrap(),
+            b"\r"
+        );
+        assert_eq!(
+            encode_key(terminal, encoder, &shift_enter, KeyAction::Press).unwrap(),
+            b"\n"
+        );
+
+        terminal.vt_write(b"\x1b[>11u");
+        assert_eq!(
+            encode_key(terminal, encoder, &shift_enter, KeyAction::Repeat).unwrap(),
+            b"\n"
+        );
+        assert_eq!(
+            encode_key(terminal, encoder, &shift_enter, KeyAction::Release).unwrap(),
+            b""
+        );
+
+        terminal.vt_write(b"\x1b[<u\x1b[>7u");
+        assert_eq!(
+            encode_key(terminal, encoder, &shift_enter, KeyAction::Press).unwrap(),
+            b"\n"
         );
     }
 
@@ -1596,11 +2265,68 @@ mod tests {
     }
 
     #[test]
+    fn mouse_wheel_uses_the_tuis_negotiated_protocol() {
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(24, 80, 800, 480)));
+        let mut core = EmulatorCore::new(&shared, 24, 80, 800, 480).unwrap();
+        core.apply(EmulatorCommand::Output(b"\x1b[?1000h\x1b[?1006h".to_vec()))
+            .unwrap();
+        let EmulatorCore {
+            terminal, mouse, ..
+        } = &mut core;
+        let bytes = encode_mouse_wheel(
+            terminal,
+            mouse,
+            2,
+            (24.0, 30.0),
+            (800, 480),
+            10,
+            20,
+            Modifiers::default(),
+        )
+        .unwrap();
+
+        assert_eq!(bytes.iter().filter(|byte| **byte == 0x1b).count(), 2);
+        assert!(bytes.starts_with(b"\x1b[<64;"));
+
+        terminal.vt_write(b"\x1b[?1000l\x1b[?1006l");
+        assert!(
+            encode_mouse_wheel(
+                terminal,
+                mouse,
+                -1,
+                (24.0, 30.0),
+                (800, 480),
+                10,
+                20,
+                Modifiers::default(),
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn maps_256_color_cube_and_grayscale() {
         assert_eq!(indexed_color(16), 0x000000);
         assert_eq!(indexed_color(231), 0xffffff);
         assert_eq!(indexed_color(232), 0x080808);
         assert_eq!(indexed_color(255), 0xeeeeee);
+    }
+
+    #[test]
+    fn terminal_palette_updates_existing_default_cells() {
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(2, 10, 100, 40)));
+        let mut core = EmulatorCore::new(&shared, 2, 10, 100, 40).unwrap();
+        let theme = TerminalTheme {
+            foreground: 0xabcdef,
+            background: 0x123456,
+            cursor: 0xfedcba,
+            ansi: [0x010203; 16],
+        };
+        configure_terminal(&mut core.terminal, theme).unwrap();
+        let screen = core.screen().unwrap();
+        assert_eq!(screen.cells[0].foreground, theme.foreground);
+        assert_eq!(screen.cells[0].background, theme.background);
     }
 
     #[test]
@@ -1711,6 +2437,26 @@ mod tests {
             panic!("expected a Kitty graphics capability response");
         };
         assert_eq!(bytes, b"\x1b_Gi=1;OK\x1b\\");
+    }
+
+    #[test]
+    fn ghostty_answers_keyboard_enhancement_probe() {
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        daemon
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(3, 10, 100, 60)));
+        shared.install_writer(&client).unwrap();
+        let mut core = EmulatorCore::new(&shared, 3, 10, 100, 60).unwrap();
+
+        core.apply(EmulatorCommand::Output(b"\x1b[?u".to_vec()))
+            .unwrap();
+
+        let response = AttachFrame::read_from(&mut daemon).unwrap();
+        let AttachFrame::Input(bytes) = response else {
+            panic!("expected a keyboard enhancement response");
+        };
+        assert_eq!(bytes, b"\x1b[?0u");
     }
 
     #[test]
