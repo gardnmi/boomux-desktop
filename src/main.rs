@@ -66,6 +66,8 @@ actions!(
         CenterFloating,
         CyclePaneNext,
         CyclePanePrevious,
+        CycleWorkspaceNext,
+        CycleWorkspacePrevious,
         NewPane,
         ClosePane,
         ToggleFloating,
@@ -185,6 +187,8 @@ const KEY_REMOVE_SHELL: &str = "secondary-shift-w";
 const KEY_TOGGLE_FLOATING: &str = "secondary-o";
 const KEY_TOGGLE_FULLSCREEN: &str = "secondary-f";
 const KEY_TOGGLE_SIDEBAR_DRAWER: &str = "secondary-b";
+const KEY_NEXT_WORKSPACE: &str = "secondary-pagedown";
+const KEY_PREVIOUS_WORKSPACE: &str = "secondary-pageup";
 
 const HELP_SHORTCUTS: &[ShortcutSpec] = &[
     ShortcutSpec {
@@ -211,6 +215,11 @@ const HELP_SHORTCUTS: &[ShortcutSpec] = &[
         section: ShortcutSection::Navigation,
         keys: "Ctrl + Tab / Ctrl + Shift + Tab",
         description: "Cycle panes forward or backward",
+    },
+    ShortcutSpec {
+        section: ShortcutSection::Navigation,
+        keys: "Ctrl + Page Up / Page Down",
+        description: "Cycle Workspaces in sidebar order",
     },
     ShortcutSpec {
         section: ShortcutSection::Navigation,
@@ -683,6 +692,30 @@ fn workspace_slide_direction(
         (Some(current), Some(target)) if target < current => -1.0,
         _ => 1.0,
     }
+}
+
+fn cycled_workspace_id<'a>(
+    workspace_order: &'a [String],
+    current_workspace_id: Option<&str>,
+    backwards: bool,
+) -> Option<&'a str> {
+    let count = workspace_order.len();
+    if count == 0 {
+        return None;
+    }
+    let Some(current) = current_workspace_id
+        .and_then(|id| workspace_order.iter().position(|workspace| workspace == id))
+    else {
+        return workspace_order
+            .get(if backwards { count - 1 } else { 0 })
+            .map(String::as_str);
+    };
+    let next = if backwards {
+        (current + count - 1) % count
+    } else {
+        (current + 1) % count
+    };
+    workspace_order.get(next).map(String::as_str)
 }
 
 fn shifted_workspace_rect(rect: Rect, direction: f32) -> Rect {
@@ -1368,6 +1401,36 @@ impl Workspace {
             return;
         };
         self.focus_terminal_pane(next, window, cx);
+    }
+
+    fn cycle_workspace(&mut self, backwards: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let current_workspace_id = self
+            .terminals
+            .get(&self.focused)
+            .and_then(|pane| pane.shell.as_ref())
+            .map(|shell| shell.workspace_id.as_str());
+        let Some(workspace_id) =
+            cycled_workspace_id(&self.workspace_order, current_workspace_id, backwards)
+                .map(str::to_owned)
+        else {
+            return;
+        };
+        if current_workspace_id == Some(workspace_id.as_str()) {
+            return;
+        }
+        let preferred_shell_id = self
+            .boomux_overview
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .and_then(|workspace| {
+                workspace
+                    .shells
+                    .iter()
+                    .find(|shell| !self.minimized_shells.contains(&shell.id))
+            })
+            .map(|shell| shell.id.clone());
+        self.open_workspace(&workspace_id, preferred_shell_id.as_deref(), window, cx);
     }
 
     fn focus_terminal_pane(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -3095,6 +3158,22 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.cycle_pane(true, window, cx);
+    }
+    fn cycle_workspace_next(
+        &mut self,
+        _: &CycleWorkspaceNext,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cycle_workspace(false, window, cx);
+    }
+    fn cycle_workspace_previous(
+        &mut self,
+        _: &CycleWorkspacePrevious,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cycle_workspace(true, window, cx);
     }
 
     fn move_sidebar_selection(
@@ -6903,6 +6982,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::center_floating))
             .on_action(cx.listener(Self::cycle_pane_next))
             .on_action(cx.listener(Self::cycle_pane_previous))
+            .on_action(cx.listener(Self::cycle_workspace_next))
+            .on_action(cx.listener(Self::cycle_workspace_previous))
             .on_action(cx.listener(Self::new_pane))
             .on_action(cx.listener(Self::close_pane))
             .on_action(cx.listener(Self::toggle_floating))
@@ -6966,6 +7047,8 @@ fn workspace_keystroke(keystroke: &gpui::Keystroke) -> bool {
                 | "r"
                 | "c"
                 | "tab"
+                | "pageup"
+                | "pagedown"
                 | "space"
         )
 }
@@ -7251,6 +7334,12 @@ fn main() {
             KeyBinding::new("secondary-alt-c", CenterFloating, Some("Workspace")),
             KeyBinding::new("secondary-tab", CyclePaneNext, Some("Workspace")),
             KeyBinding::new("secondary-shift-tab", CyclePanePrevious, Some("Workspace")),
+            KeyBinding::new(KEY_NEXT_WORKSPACE, CycleWorkspaceNext, Some("Workspace")),
+            KeyBinding::new(
+                KEY_PREVIOUS_WORKSPACE,
+                CycleWorkspacePrevious,
+                Some("Workspace"),
+            ),
             KeyBinding::new(KEY_NEW_PANE, NewPane, Some("Workspace")),
             KeyBinding::new(KEY_REMOVE_SHELL, RemoveShell, Some("Workspace")),
             KeyBinding::new(KEY_DETACH_PANE, ClosePane, Some("Workspace")),
@@ -7478,6 +7567,31 @@ mod pointer_tests {
         };
         assert_eq!(shifted_workspace_rect(target, 1.0).x, 1.25);
         assert_eq!(shifted_workspace_rect(target, -1.0).x, -0.75);
+    }
+
+    #[test]
+    fn workspace_cycle_wraps_in_both_directions() {
+        let order = vec![
+            "alpha".to_string(),
+            "bravo".to_string(),
+            "charlie".to_string(),
+        ];
+
+        assert_eq!(
+            cycled_workspace_id(&order, Some("alpha"), false),
+            Some("bravo")
+        );
+        assert_eq!(
+            cycled_workspace_id(&order, Some("charlie"), false),
+            Some("alpha")
+        );
+        assert_eq!(
+            cycled_workspace_id(&order, Some("alpha"), true),
+            Some("charlie")
+        );
+        assert_eq!(cycled_workspace_id(&order, None, false), Some("alpha"));
+        assert_eq!(cycled_workspace_id(&order, None, true), Some("charlie"));
+        assert_eq!(cycled_workspace_id(&[], None, false), None);
     }
 
     #[test]
