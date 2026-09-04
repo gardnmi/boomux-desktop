@@ -61,12 +61,25 @@ must also track the number and byte size of live image generations.
   and are dropped explicitly afterward.
 - Overview refresh and Boomux requests stay off the render path.
 - Terminal output is coalesced before publishing a new screen snapshot.
+- Each pane has a capacity-one terminal-update mailbox. Idle panes do not poll,
+  and output bursts wake GPUI once to consume the newest immutable snapshot.
+- Screen delivery uses shared immutable snapshots instead of cloning every cell
+  into the GPUI model. Common cell text remains inline, avoiding a heap
+  allocation for typical one-codepoint cells.
+- Each open pane retains at most one shaped-text paint cache for its current
+  screen and selection. Layout-only animation frames reuse it; replacement and
+  pane closure release the previous cache.
+- Kitty pixel buffers and GPUI image objects are reused while their terminal
+  generation remains unchanged, and image reconciliation runs only for a new
+  screen snapshot.
 - Absolute scrollbar seeks use one per-pane atomic latest-value mailbox and at
   most one queued wake-up marker, so pointer movement cannot build an
   unbounded or stale scroll backlog.
 - A minimized tab owns only Boomux overview identity and presentation metadata;
   animated minimization retains pane state only for the bounded motion duration,
   then releases its emulator snapshots and GPU images before adding the tab.
+- A Workspace switch retains outgoing pane state only for the selected bounded
+  motion duration, then detaches it and releases its emulator and GPU resources.
 
 Any new queue, cache, history, retry, image store, or task must document its
 bound and cleanup owner.

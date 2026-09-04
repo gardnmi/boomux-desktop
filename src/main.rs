@@ -11,8 +11,8 @@ use gpui::{
     Animation, AnimationExt, App, Bounds, ClickEvent, ClipboardItem, Context, Corners, CursorStyle,
     Div, DragMoveEvent, FocusHandle, InteractiveElement, IntoElement, KeyBinding, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, RenderImage, ScrollAnchor,
-    ScrollHandle, ScrollWheelEvent, SharedString, Stateful, TextRun, UnderlineStyle, Window,
-    WindowBounds, WindowOptions, actions, canvas, div, ease_out_quint, fill, font, point,
+    ScrollHandle, ScrollWheelEvent, ShapedLine, SharedString, Stateful, TextRun, UnderlineStyle,
+    Window, WindowBounds, WindowOptions, actions, canvas, div, ease_out_quint, fill, font, point,
     prelude::*, px, relative, rgb, rgb_to_hsla, rgba, size,
 };
 use layout::{Axis, Direction, Node, Rect};
@@ -561,6 +561,14 @@ struct PaneMinimizeAnimation {
     duration: Duration,
 }
 
+#[derive(Clone, Debug)]
+struct WorkspaceTransition {
+    outgoing: Vec<FloatingPane>,
+    direction: f32,
+    generation: u64,
+    duration: Duration,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum PointerOperation {
     Move,
@@ -659,6 +667,29 @@ fn reveal_opened_workspace(
         expanded_workspaces.clear();
     }
     expanded_workspaces.insert(workspace_id.to_string());
+}
+
+fn workspace_slide_direction(
+    workspace_order: &[String],
+    current_workspace_id: Option<&str>,
+    target_workspace_id: &str,
+) -> f32 {
+    let current_index = current_workspace_id
+        .and_then(|id| workspace_order.iter().position(|workspace| workspace == id));
+    let target_index = workspace_order
+        .iter()
+        .position(|workspace| workspace == target_workspace_id);
+    match (current_index, target_index) {
+        (Some(current), Some(target)) if target < current => -1.0,
+        _ => 1.0,
+    }
+}
+
+fn shifted_workspace_rect(rect: Rect, direction: f32) -> Rect {
+    Rect {
+        x: rect.x + direction,
+        ..rect
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1119,6 +1150,7 @@ struct Workspace {
     workspace_order_animation: Option<WorkspaceOrderAnimation>,
     floating_animation: Option<FloatingAnimation>,
     minimizing_panes: Vec<PaneMinimizeAnimation>,
+    workspace_transition: Option<WorkspaceTransition>,
     animation_generation: u64,
     focused: usize,
     fullscreen: Option<usize>,
@@ -1168,6 +1200,22 @@ struct TerminalPane {
     scrollbar_fade_generation: u64,
     selection: Option<TerminalSelection>,
     render_images: HashMap<u64, Arc<RenderImage>>,
+    render_image_screen: Option<Arc<TerminalScreen>>,
+    paint_cache: Option<Arc<TerminalPaintCache>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalBackground {
+    row: usize,
+    col: usize,
+    color: u32,
+}
+
+struct TerminalPaintCache {
+    screen: Arc<TerminalScreen>,
+    selection: Option<TerminalSelection>,
+    lines: Vec<ShapedLine>,
+    backgrounds: Vec<TerminalBackground>,
 }
 
 impl Workspace {
@@ -1231,6 +1279,7 @@ impl Workspace {
             workspace_order_animation: None,
             floating_animation: None,
             minimizing_panes: Vec::new(),
+            workspace_transition: None,
             animation_generation: 0,
             focused: 1,
             fullscreen: None,
@@ -2491,6 +2540,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .workspace_transition
+            .as_ref()
+            .is_some_and(|transition| transition.outgoing.iter().any(|outgoing| outgoing.id == id))
+        {
+            return;
+        }
         self.floating_animation = None;
         self.focused = id;
         self.raise_floating_pane(id);
@@ -2541,6 +2597,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .workspace_transition
+            .as_ref()
+            .is_some_and(|transition| transition.outgoing.iter().any(|outgoing| outgoing.id == id))
+        {
+            return;
+        }
         // Keep the dragged pane focused even while it crosses other panes.
         if self.pointer_drag.is_some() || self.terminal_scrollbar_drag.is_some() {
             return;
@@ -3321,7 +3384,7 @@ impl Workspace {
                 match result {
                     Ok(terminal) => {
                         let shell_id = terminal.shell_id.clone();
-                        pane.screen = Some(Arc::new(terminal.screen()));
+                        pane.screen = Some(terminal.screen());
                         pane.shell = Some(attached_shell);
                         pane.session = Some(terminal);
                         this.watch_terminal(pane_id, shell_id, cx);
@@ -3377,7 +3440,7 @@ impl Workspace {
                 match result {
                     Ok((shell, session, overview)) => {
                         let shell_id = session.shell_id.clone();
-                        pane.screen = Some(Arc::new(session.screen()));
+                        pane.screen = Some(session.screen());
                         pane.shell = Some(shell);
                         pane.session = Some(session);
                         if let Some(overview) = overview {
@@ -3467,7 +3530,7 @@ impl Workspace {
                 match result {
                     Ok((shell, session, overview)) => {
                         let shell_id = session.shell_id.clone();
-                        pane.screen = Some(Arc::new(session.screen()));
+                        pane.screen = Some(session.screen());
                         pane.shell = Some(shell);
                         pane.session = Some(session);
                         if let Some(overview) = overview {
@@ -3531,7 +3594,7 @@ impl Workspace {
                     Ok((shell, session, overview)) => {
                         let shell_id = session.shell_id.clone();
                         let workspace_id = shell.workspace_id.clone();
-                        pane.screen = Some(Arc::new(session.screen()));
+                        pane.screen = Some(session.screen());
                         pane.shell = Some(shell);
                         pane.session = Some(session);
                         reveal_opened_workspace(
@@ -3660,7 +3723,47 @@ impl Workspace {
         self.layout_animation = None;
         self.floating_animation = None;
         self.minimizing_panes.clear();
+        self.workspace_transition = None;
         self.fullscreen = None;
+    }
+
+    fn detach_terminal_ids(&mut self, pane_ids: &[usize], window: &mut Window) {
+        for pane_id in pane_ids {
+            if let Some(pane) = self.terminals.remove(pane_id) {
+                for image in pane.render_images.into_values() {
+                    let _ = window.drop_image(image);
+                }
+            }
+        }
+    }
+
+    fn finish_current_workspace_transition(&mut self, window: &mut Window) {
+        let Some(transition) = self.workspace_transition.take() else {
+            return;
+        };
+        let pane_ids = transition
+            .outgoing
+            .iter()
+            .map(|pane| pane.id)
+            .collect::<Vec<_>>();
+        self.detach_terminal_ids(&pane_ids, window);
+    }
+
+    fn finish_workspace_transition(
+        &mut self,
+        generation: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .workspace_transition
+            .as_ref()
+            .is_none_or(|transition| transition.generation != generation)
+        {
+            return;
+        }
+        self.finish_current_workspace_transition(window);
+        cx.notify();
     }
 
     fn open_workspace(
@@ -3690,6 +3793,16 @@ impl Workspace {
         };
 
         self.sidebar_menu = None;
+        let current_workspace_id = self
+            .terminals
+            .get(&self.focused)
+            .and_then(|pane| pane.shell.as_ref())
+            .map(|shell| shell.workspace_id.clone());
+        let slide_direction = workspace_slide_direction(
+            &self.workspace_order,
+            current_workspace_id.as_deref(),
+            workspace_id,
+        );
         reveal_opened_workspace(
             self.workspace_pane_mode,
             &mut self.expanded_workspaces,
@@ -3706,12 +3819,72 @@ impl Workspace {
                 .filter_map(|pane| pane.shell.as_ref().map(|shell| shell.id.clone()))
                 .collect::<HashSet<_>>();
             if workspace_open_replaces_panes(self.workspace_pane_mode, &current, &desired) {
-                self.detach_all_panes(window);
+                self.finish_current_workspace_transition(window);
+                let mut outgoing = self
+                    .layout
+                    .as_ref()
+                    .map(Node::pane_ids)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .chain(self.floating.iter().map(|pane| pane.id))
+                    .filter_map(|pane_id| self.pane_bounds_in_panel(pane_id, window))
+                    .collect::<Vec<_>>();
+                for animation in &self.minimizing_panes {
+                    if !outgoing.iter().any(|pane| pane.id == animation.pane_id) {
+                        outgoing.push(animation.from.clone());
+                    }
+                }
+                let outgoing_ids = outgoing.iter().map(|pane| pane.id).collect::<Vec<_>>();
+                let should_animate = !current.is_empty() && !outgoing.is_empty();
+
+                self.layout = None;
+                self.floating.clear();
+                self.pointer_drag = None;
+                self.terminal_scrollbar_drag = None;
+                self.layout_animation = None;
+                self.floating_animation = None;
+                self.minimizing_panes.clear();
+                self.fullscreen = None;
+
+                if let Some(duration) = self.motion_speed.duration().filter(|_| should_animate) {
+                    self.animation_generation = self.animation_generation.wrapping_add(1);
+                    let generation = self.animation_generation;
+                    self.workspace_transition = Some(WorkspaceTransition {
+                        outgoing,
+                        direction: slide_direction,
+                        generation,
+                        duration,
+                    });
+                    let window_handle = window.window_handle();
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(duration).await;
+                        let _ = window_handle.update(cx, |_, window, cx| {
+                            this.update(cx, |this, cx| {
+                                this.finish_workspace_transition(generation, window, cx);
+                            })
+                        });
+                    })
+                    .detach();
+                } else {
+                    self.detach_terminal_ids(&outgoing_ids, window);
+                }
             }
         }
 
         let mut pane_ids = HashMap::new();
         for (pane_id, pane) in &self.terminals {
+            if self
+                .workspace_transition
+                .as_ref()
+                .is_some_and(|transition| {
+                    transition
+                        .outgoing
+                        .iter()
+                        .any(|outgoing| outgoing.id == *pane_id)
+                })
+            {
+                continue;
+            }
             if let Some(shell) = &pane.shell {
                 pane_ids.insert(shell.id.clone(), *pane_id);
             }
@@ -3728,6 +3901,23 @@ impl Workspace {
             }
             pane_ids.insert(shell.id.clone(), pane_id);
             pending.push((pane_id, shell));
+        }
+
+        if self.workspace_transition.is_some() {
+            let incoming = self
+                .layout
+                .as_ref()
+                .map(|layout| {
+                    layout
+                        .rects()
+                        .into_iter()
+                        .map(|(pane_id, rect)| {
+                            (pane_id, shifted_workspace_rect(rect, slide_direction))
+                        })
+                        .collect::<HashMap<_, _>>()
+                })
+                .unwrap_or_default();
+            self.begin_layout_animation(incoming);
         }
 
         let preferred_pane = preferred_shell_id
@@ -3838,12 +4028,17 @@ impl Workspace {
     }
 
     fn watch_terminal(&self, pane_id: usize, shell_id: String, cx: &mut Context<Self>) {
+        let Some((update_events, mut revision)) = self
+            .terminals
+            .get(&pane_id)
+            .and_then(|pane| pane.session.as_ref())
+            .filter(|terminal| terminal.shell_id == shell_id)
+            .map(|terminal| (terminal.update_events(), terminal.revision()))
+        else {
+            return;
+        };
         cx.spawn(async move |this, cx| {
-            let mut revision = 0;
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(33))
-                    .await;
+            while update_events.recv().await.is_ok() {
                 let keep_watching = this
                     .update(cx, |this, cx| {
                         let Some(pane) = this.terminals.get_mut(&pane_id) else {
@@ -3858,7 +4053,7 @@ impl Workspace {
                         };
                         let next_revision = terminal.revision();
                         if next_revision != revision {
-                            pane.screen = Some(Arc::new(terminal.screen()));
+                            pane.screen = Some(terminal.screen());
                             revision = next_revision;
                             cx.notify();
                         }
@@ -3922,6 +4117,13 @@ impl Workspace {
             let Some(screen) = pane.screen.as_ref() else {
                 continue;
             };
+            if pane
+                .render_image_screen
+                .as_ref()
+                .is_some_and(|rendered| Arc::ptr_eq(rendered, screen))
+            {
+                continue;
+            }
             let active = screen
                 .images
                 .iter()
@@ -3952,6 +4154,26 @@ impl Workspace {
                             buffer,
                         )]))
                     });
+            }
+            pane.render_image_screen = Some(Arc::clone(screen));
+        }
+    }
+
+    fn refresh_terminal_paint_caches(&mut self, window: &mut Window) {
+        for pane in self.terminals.values_mut() {
+            let Some(screen) = pane.screen.as_ref() else {
+                pane.paint_cache = None;
+                continue;
+            };
+            let current = pane.paint_cache.as_ref().is_some_and(|cache| {
+                Arc::ptr_eq(&cache.screen, screen) && cache.selection == pane.selection
+            });
+            if !current {
+                pane.paint_cache = Some(Arc::new(prepare_terminal_paint(
+                    Arc::clone(screen),
+                    pane.selection,
+                    window,
+                )));
             }
         }
     }
@@ -5923,8 +6145,10 @@ impl Workspace {
                 .relative()
                 .size_full()
                 .child(terminal_view(
-                    Arc::clone(screen),
-                    pane.and_then(|pane| pane.selection),
+                    Arc::clone(
+                        pane.and_then(|pane| pane.paint_cache.as_ref())
+                            .expect("terminal paint cache refreshed before rendering"),
+                    ),
                     screen
                         .image_placements
                         .iter()
@@ -6390,27 +6614,27 @@ impl Render for Workspace {
         if window.window_title() != desktop_title {
             window.set_window_title(&desktop_title);
         }
-        let terminal_ids = self.terminals.keys().copied().collect::<Vec<_>>();
-        let terminal_sizes = terminal_ids
-            .into_iter()
-            .filter(|id| {
-                !self
-                    .minimizing_panes
-                    .iter()
-                    .any(|animation| animation.pane_id == *id)
-            })
-            .map(|id| (id, self.terminal_grid_size(id, window)))
-            .collect::<Vec<_>>();
-        for (id, (rows, cols, pixel_width, pixel_height)) in terminal_sizes {
-            if let Some(terminal) = self
-                .terminals
-                .get(&id)
-                .and_then(|pane| pane.session.as_ref())
+        for (&id, pane) in &self.terminals {
+            if self
+                .minimizing_panes
+                .iter()
+                .any(|animation| animation.pane_id == id)
+                || self
+                    .workspace_transition
+                    .as_ref()
+                    .is_some_and(|transition| {
+                        transition.outgoing.iter().any(|outgoing| outgoing.id == id)
+                    })
             {
+                continue;
+            }
+            if let Some(terminal) = pane.session.as_ref() {
+                let (rows, cols, pixel_width, pixel_height) = self.terminal_grid_size(id, window);
                 terminal.resize(rows, cols, pixel_width, pixel_height);
             }
         }
         self.refresh_terminal_images(window);
+        self.refresh_terminal_paint_caches(window);
         let tiled = if let Some(layout) = &self.layout {
             self.render_layout(layout, cx)
         } else {
@@ -6541,6 +6765,48 @@ impl Render for Workspace {
             })
             .collect::<Vec<_>>();
 
+        let workspace_leaving = self
+            .workspace_transition
+            .as_ref()
+            .map(|transition| {
+                let panel_width = self.panel_size(window).0;
+                transition
+                    .outgoing
+                    .iter()
+                    .filter(|outgoing| self.terminals.contains_key(&outgoing.id))
+                    .map(|outgoing| {
+                        let from = outgoing.clone();
+                        let target = FloatingPane {
+                            x: from.x - transition.direction * panel_width,
+                            ..from.clone()
+                        };
+                        let animation_id = SharedString::from(format!(
+                            "workspace-leave-{}-{}",
+                            transition.generation, outgoing.id
+                        ));
+                        div()
+                            .absolute()
+                            .p(px(self.pane_gap / 2.0))
+                            .child(self.pane(outgoing.id, cx))
+                            .with_animation(
+                                animation_id,
+                                Animation::new(transition.duration).with_easing(ease_out_quint()),
+                                move |element, progress| {
+                                    let bounds =
+                                        interpolate_floating_pane(&from, &target, progress);
+                                    element
+                                        .left(px(bounds.x))
+                                        .top(px(bounds.y))
+                                        .w(px(bounds.width))
+                                        .h(px(bounds.height))
+                                },
+                            )
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
         let minimized_tabs = self.minimized_tab_strip(cx);
         let terminal_area = div()
             .h_full()
@@ -6554,10 +6820,12 @@ impl Render for Workspace {
                     .relative()
                     .flex_1()
                     .min_h_0()
+                    .overflow_hidden()
                     .p(px(self.pane_gap))
                     .child(tiled)
                     .children(floating)
-                    .children(minimizing),
+                    .children(minimizing)
+                    .children(workspace_leaving),
             );
 
         let target_drawer_width = self.sidebar_width();
@@ -6728,93 +6996,129 @@ fn relative_time(timestamp_ms: u64) -> String {
 
 type RenderedTerminalImage = (TerminalImagePlacement, Arc<RenderImage>);
 
-fn terminal_view(
+fn same_text_run_style(left: &TextRun, right: &TextRun) -> bool {
+    left.font == right.font
+        && left.color == right.color
+        && left.background_color == right.background_color
+        && left.underline == right.underline
+        && left.strikethrough == right.strikethrough
+        && left.letter_spacing == right.letter_spacing
+}
+
+fn push_text_run(runs: &mut Vec<TextRun>, run: TextRun) {
+    if let Some(previous) = runs.last_mut()
+        && same_text_run_style(previous, &run)
+    {
+        previous.len += run.len;
+    } else {
+        runs.push(run);
+    }
+}
+
+fn prepare_terminal_paint(
     screen: Arc<TerminalScreen>,
     selection: Option<TerminalSelection>,
-    images: Vec<RenderedTerminalImage>,
-) -> Div {
+    window: &mut Window,
+) -> TerminalPaintCache {
+    let cols = usize::from(screen.cols);
+    let mut lines = Vec::with_capacity(usize::from(screen.rows));
+    let mut backgrounds = Vec::new();
+    let mut base_font = font("JetBrainsMono Nerd Font");
+    base_font.features = gpui::FontFeatures::disable_ligatures();
+    let selection_range = selection.map(|selection| selection_indices(selection, cols));
+
+    for (row, cells) in screen.cells.chunks(cols).enumerate() {
+        let mut text = String::new();
+        let mut runs = Vec::with_capacity(cells.len());
+        for (col, cell) in cells.iter().enumerate() {
+            let selected = selection_range.is_some_and(|(start, end)| {
+                let index = row * cols + col;
+                (start..=end).contains(&index)
+            });
+            let (foreground, background) = if selected {
+                (0xcdd6f4, 0x45475a)
+            } else if cell.cursor {
+                (0x1e1e2e, 0xcba6f7)
+            } else {
+                (cell.foreground, cell.background)
+            };
+            if background != 0x11111b {
+                backgrounds.push(TerminalBackground {
+                    row,
+                    col,
+                    color: background,
+                });
+            }
+            let start = text.len();
+            // Keep one shaped glyph slot for every terminal cell. A wide
+            // character paints from its leading cell; its continuation is an
+            // inkless space so subsequent glyphs retain their exact columns.
+            if cell.continuation {
+                text.push(' ');
+            } else {
+                text.push_str(&cell.text);
+            }
+            let mut cell_font = base_font.clone();
+            if cell.bold {
+                cell_font = cell_font.bold();
+            }
+            if cell.italic {
+                cell_font = cell_font.italic();
+            }
+            push_text_run(
+                &mut runs,
+                TextRun {
+                    len: text.len() - start,
+                    font: cell_font,
+                    color: rgb_to_hsla(rgb(foreground)),
+                    underline: cell.underline.then_some(UnderlineStyle {
+                        thickness: px(1.0),
+                        color: Some(rgb_to_hsla(rgb(foreground))),
+                        wavy: false,
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+        lines.push(window.text_system().shape_line(
+            text.into(),
+            px(13.0),
+            &runs,
+            Some(px(TERMINAL_CELL_WIDTH)),
+        ));
+    }
+
+    TerminalPaintCache {
+        screen,
+        selection,
+        lines,
+        backgrounds,
+    }
+}
+
+fn terminal_view(paint_cache: Arc<TerminalPaintCache>, images: Vec<RenderedTerminalImage>) -> Div {
+    let cached_paint = Arc::clone(&paint_cache);
     div().size_full().overflow_hidden().bg(rgb(0x11111b)).child(
         canvas(
-            move |bounds, window, _| {
-                let cols = usize::from(screen.cols);
-                let mut lines = Vec::with_capacity(usize::from(screen.rows));
-                let mut backgrounds = Vec::new();
-                let mut base_font = font("JetBrainsMono Nerd Font");
-                base_font.features = gpui::FontFeatures::disable_ligatures();
-
-                for (row, cells) in screen.cells.chunks(cols).enumerate() {
-                    let mut text = String::new();
-                    let mut runs = Vec::with_capacity(cells.len());
-                    for (col, cell) in cells.iter().enumerate() {
-                        let selected = selection.is_some_and(|selection| {
-                            let (start, end) = selection_indices(selection, cols);
-                            let index = row * cols + col;
-                            (start..=end).contains(&index)
-                        });
-                        let (foreground, background) = if selected {
-                            (0xcdd6f4, 0x45475a)
-                        } else if cell.cursor {
-                            (0x1e1e2e, 0xcba6f7)
-                        } else {
-                            (cell.foreground, cell.background)
-                        };
-                        if background != 0x11111b {
-                            backgrounds.push(fill(
-                                Bounds::new(
-                                    point(
-                                        bounds.left() + px(8.0 + col as f32 * TERMINAL_CELL_WIDTH),
-                                        bounds.top() + px(8.0 + row as f32 * TERMINAL_CELL_HEIGHT),
-                                    ),
-                                    size(px(TERMINAL_CELL_WIDTH), px(TERMINAL_CELL_HEIGHT)),
-                                ),
-                                rgb(background),
-                            ));
-                        }
-                        let start = text.len();
-                        // Keep one shaped glyph slot for every terminal cell.
-                        // A wide character paints from its leading cell; its
-                        // continuation is represented by an inkless space so
-                        // subsequent glyphs still land on the correct column.
-                        if cell.continuation {
-                            text.push(' ');
-                        } else {
-                            text.push_str(&cell.text);
-                        }
-                        let mut cell_font = base_font.clone();
-                        if cell.bold {
-                            cell_font = cell_font.bold();
-                        }
-                        if cell.italic {
-                            cell_font = cell_font.italic();
-                        }
-                        runs.push(TextRun {
-                            len: text.len() - start,
-                            font: cell_font,
-                            color: rgb_to_hsla(rgb(foreground)),
-                            underline: cell.underline.then_some(UnderlineStyle {
-                                thickness: px(1.0),
-                                color: Some(rgb_to_hsla(rgb(foreground))),
-                                wavy: false,
-                            }),
-                            ..Default::default()
-                        });
-                    }
-                    lines.push(window.text_system().shape_line(
-                        text.into(),
-                        px(13.0),
-                        &runs,
-                        Some(px(TERMINAL_CELL_WIDTH)),
+            move |_, _, _| images,
+            move |bounds, images, window, cx| {
+                paint_terminal_images(bounds, &images, |z| z < i32::MIN / 2, window);
+                for background in &cached_paint.backgrounds {
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(
+                                bounds.left()
+                                    + px(8.0 + background.col as f32 * TERMINAL_CELL_WIDTH),
+                                bounds.top()
+                                    + px(8.0 + background.row as f32 * TERMINAL_CELL_HEIGHT),
+                            ),
+                            size(px(TERMINAL_CELL_WIDTH), px(TERMINAL_CELL_HEIGHT)),
+                        ),
+                        rgb(background.color),
                     ));
                 }
-                (lines, backgrounds, images)
-            },
-            move |bounds, (lines, backgrounds, images), window, cx| {
-                paint_terminal_images(bounds, &images, |z| z < i32::MIN / 2, window);
-                for background in backgrounds {
-                    window.paint_quad(background);
-                }
                 paint_terminal_images(bounds, &images, |z| (i32::MIN / 2..0).contains(&z), window);
-                for (row, line) in lines.iter().enumerate() {
+                for (row, line) in cached_paint.lines.iter().enumerate() {
                     let origin = point(
                         bounds.left() + px(8.0),
                         bounds.top() + px(8.0 + row as f32 * TERMINAL_CELL_HEIGHT),
@@ -7001,6 +7305,39 @@ mod pointer_tests {
     }
 
     #[test]
+    fn adjacent_terminal_text_runs_with_the_same_style_are_coalesced() {
+        let mut runs = Vec::new();
+        push_text_run(
+            &mut runs,
+            TextRun {
+                len: 1,
+                color: rgb_to_hsla(rgb(0xcdd6f4)),
+                ..Default::default()
+            },
+        );
+        push_text_run(
+            &mut runs,
+            TextRun {
+                len: 3,
+                color: rgb_to_hsla(rgb(0xcdd6f4)),
+                ..Default::default()
+            },
+        );
+        push_text_run(
+            &mut runs,
+            TextRun {
+                len: 2,
+                color: rgb_to_hsla(rgb(0xf38ba8)),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].len, 4);
+        assert_eq!(runs[1].len, 2);
+    }
+
+    #[test]
     fn pointer_coordinates_use_the_terminal_panel_origin() {
         assert_eq!(
             window_point_to_panel(425.0, 92.0, SIDEBAR_WIDTH),
@@ -7118,11 +7455,37 @@ mod pointer_tests {
     }
 
     #[test]
+    fn workspace_switch_slides_in_the_sidebar_order_direction() {
+        let order = vec![
+            "alpha".to_string(),
+            "bravo".to_string(),
+            "charlie".to_string(),
+        ];
+        assert_eq!(
+            workspace_slide_direction(&order, Some("alpha"), "charlie"),
+            1.0
+        );
+        assert_eq!(
+            workspace_slide_direction(&order, Some("charlie"), "alpha"),
+            -1.0
+        );
+
+        let target = Rect {
+            x: 0.25,
+            y: 0.0,
+            width: 0.5,
+            height: 1.0,
+        };
+        assert_eq!(shifted_workspace_rect(target, 1.0).x, 1.25);
+        assert_eq!(shifted_workspace_rect(target, -1.0).x, -0.75);
+    }
+
+    #[test]
     fn terminal_selection_extracts_rows_in_either_drag_direction() {
         let cells = "abc efg "
             .chars()
             .map(|character| terminal::TerminalCell {
-                text: character.to_string(),
+                text: character.to_string().into(),
                 foreground: 0xffffff,
                 background: 0,
                 bold: false,

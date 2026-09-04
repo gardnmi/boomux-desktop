@@ -4,6 +4,15 @@ All notable changes to Boomux Desktop will be documented in this file.
 
 ## Unreleased
 
+- Make terminal updates event-driven and coalesced, share immutable screen
+  snapshots, cache shaped paint data across layout-only frames, inline common
+  cell text, and reuse unchanged Kitty image pixels to reduce idle and animation
+  hot-path work.
+- Slide outgoing and incoming pane sets between Workspaces using the selected
+  Fast or Smooth motion speed while keeping Instant switches immediate.
+- Pin the Boomux client to v1.9.5 and document v1.9.3 as the minimum daemon
+  version with the primary-output backpressure required for reliable Kitty
+  graphics.
 - Establish the standalone Boomux Desktop project from the GPUI tiling-terminal
   proof of concept.
 - Add Workspace and Shell action menus, background lifecycle mutations, rename

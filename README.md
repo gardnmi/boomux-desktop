@@ -25,11 +25,15 @@ Building the vendored libghostty dependency requires Zig 0.15.2 on `PATH`. It is
 PATH=/path/to/zig-0.15.2:$PATH cargo run
 ```
 
-The Boomux client dependency is pinned to an exact upstream revision for reproducible standalone builds. On startup the app selects the most recently focused local Boomux Shell, falling back to the first available Shell, then opens every Shell in its Workspace and focuses the selected one. A pending Shell starts, an exited Shell restarts, and a running Shell is taken over from its current terminal attachment. There is no intermediate shell picker.
-
-High-volume Kitty graphics also require the primary-controller backpressure fix
-currently being prepared in Boomux. The first Boomux Desktop release must name
-the released Boomux version containing that daemon behavior.
+The Boomux client dependency is pinned to the exact Boomux v1.9.5 release
+revision for reproducible standalone builds. Boomux Desktop requires a Boomux
+daemon at v1.9.3 or newer because that release added the primary-controller
+backpressure required for reliable high-volume Kitty graphics; v1.9.5 is the
+currently pinned and tested release. On startup the app selects the most
+recently focused local Boomux Shell, falling back to the first available Shell,
+then opens every Shell in its Workspace and focuses the selected one. A pending
+Shell starts, an exited Shell restarts, and a running Shell is taken over from
+its current terminal attachment. There is no intermediate shell picker.
 
 For development and repeatable terminal integration tests, `BOOMUX_DESKTOP_SHELL_ID=<exact-local-shell-id>` overrides the initial shell selection.
 
@@ -119,8 +123,9 @@ mixed. Mixed gives every pane a stable, randomly varied set of corner curves;
 the same menu adjusts spacing between tiled panes, the strength of the focused
 pane border and heading, and window-motion speed. Motion can be Instant, Fast,
 or Smooth (the default) and applies to pane swaps, reflow, and tiled/floating
-transitions. These options affect presentation only and do not change Boomux
-resources.
+transitions. In Workspace scope it also slides the outgoing and incoming pane
+sets in sidebar order when switching Workspaces. These options affect
+presentation only and do not change Boomux resources.
 
 Minimizing and restoring panes follows the selected motion speed. Fast and
 Smooth animate the pane and surrounding layout; Instant applies the new layout

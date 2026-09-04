@@ -40,9 +40,11 @@ pressure propagates back through the Boomux socket to the PTY producer; arbitrar
 terminal bytes are never discarded because doing so could corrupt escape or
 Kitty graphics sequences.
 
-The worker coalesces queued commands before publishing an immutable screen
-snapshot. Synchronized-output mode delays publication until the terminal frame
-is complete.
+The worker coalesces queued commands before publishing a reference-counted,
+immutable screen snapshot. A bounded one-event mailbox wakes GPUI only when a
+new snapshot or terminal status exists; bursts collapse into one wakeup because
+the consumer always reads the newest snapshot. Synchronized-output mode delays
+publication until the terminal frame is complete.
 
 ## Rendering
 
@@ -50,7 +52,9 @@ Text cells and Kitty image placements come from the same Ghostty terminal state.
 The GPUI layer draws background images, cells, and foreground images in z-order,
 clips every placement to its pane, and caches GPU images by terminal generation.
 Images are explicitly dropped when their generation disappears or their pane
-closes.
+closes. Each pane also owns one shaped-text paint cache keyed by the exact screen
+snapshot and selection. Layout-only animation frames reuse that cache, while a
+new snapshot or selection invalidates it.
 
 The default presentation draws the binary tile layout and floating layer. The
 optional tabbed-minimization presentation keeps every open pane in that canvas.

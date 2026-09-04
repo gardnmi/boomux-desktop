@@ -7,7 +7,9 @@ repository = "https://github.com/gardnmi/boomux-desktop"
 description = "A fast native tiling terminal workspace for Boomux"
 
 [dependencies]
-boomux = { version = "=1.9.1", git = "https://github.com/gardnmi/boomux.git", rev = "87c03bff11ed062bb5f46dfcad793946116b1b26" }
+async-channel = "2.5"
+boomux = { version = "=1.9.5", git = "https://github.com/gardnmi/boomux.git", rev = "01254e346dd2f4b09ce18d54278f60e58f43e666" }
+compact_str = "=0.9.1"
 fastrand = "=2.5.0"
 gpui = { package = "gpui-ce", version = "=0.2.2" }
 gpui_platform = { package = "gpui_ce_platform", version = "=0.1.0", features = ["wayland", "x11"] }

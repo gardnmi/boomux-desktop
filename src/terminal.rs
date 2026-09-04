@@ -11,6 +11,7 @@ use boomux::client::{self, Client};
 use boomux::protocol::{
     AgentState, AttachFrame, ShellSnapshot, ShellSpec, ShellStatus, TerminalProfile,
 };
+use compact_str::CompactString;
 use gpui::Keystroke;
 use libghostty_vt::kitty::graphics::{ImageFormat, PlacementIterator};
 use libghostty_vt::render::{CellIterator, RowIterator};
@@ -90,7 +91,7 @@ pub struct BoomuxOverview {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalCell {
-    pub text: String,
+    pub text: CompactString,
     pub foreground: u32,
     pub background: u32,
     pub bold: bool,
@@ -141,7 +142,9 @@ pub struct TerminalImagePlacement {
 }
 
 struct SharedTerminal {
-    screen: Mutex<TerminalScreen>,
+    screen: Mutex<Arc<TerminalScreen>>,
+    updates: async_channel::Sender<()>,
+    update_events: async_channel::Receiver<()>,
     emulator: Mutex<Option<mpsc::SyncSender<EmulatorCommand>>>,
     writer: Mutex<Option<std::os::unix::net::UnixStream>>,
     profile: Mutex<TerminalProfile>,
@@ -156,8 +159,11 @@ struct SharedTerminal {
 
 impl SharedTerminal {
     fn new(profile: TerminalProfile) -> Self {
+        let (updates, update_events) = async_channel::bounded(1);
         Self {
-            screen: Mutex::new(blank_screen(profile.rows, profile.cols)),
+            screen: Mutex::new(Arc::new(blank_screen(profile.rows, profile.cols))),
+            updates,
+            update_events,
             emulator: Mutex::new(None),
             writer: Mutex::new(None),
             profile: Mutex::new(profile),
@@ -217,6 +223,11 @@ impl SharedTerminal {
         }
     }
 
+    fn viewport_is_at_bottom(&self) -> bool {
+        let screen = self.screen.lock().unwrap();
+        screen.scroll_offset >= screen.scroll_total.saturating_sub(screen.scroll_len)
+    }
+
     fn resize_emulator(&self, rows: u16, cols: u16, pixel_width: u16, pixel_height: u16) {
         let cell_width = u32::from(pixel_width / cols.max(1)).max(1);
         let cell_height = u32::from(pixel_height / rows.max(1)).max(1);
@@ -244,6 +255,10 @@ impl SharedTerminal {
 
     fn bump_revision(&self) {
         self.revision.fetch_add(1, Ordering::Release);
+        // One pending event is enough: consumers always load the latest
+        // immutable screen. This bounds wakeups when terminal output arrives
+        // faster than GPUI can paint it.
+        let _ = self.updates.try_send(());
     }
 
     fn install_writer(&self, stream: &std::os::unix::net::UnixStream) -> Result<(), String> {
@@ -365,8 +380,12 @@ impl TerminalSession {
         }
     }
 
-    pub fn screen(&self) -> TerminalScreen {
-        self.shared.screen.lock().unwrap().clone()
+    pub fn screen(&self) -> Arc<TerminalScreen> {
+        Arc::clone(&self.shared.screen.lock().unwrap())
+    }
+
+    pub fn update_events(&self) -> async_channel::Receiver<()> {
+        self.shared.update_events.clone()
     }
 
     pub fn send_key(&self, keystroke: &Keystroke) -> bool {
@@ -376,9 +395,10 @@ impl TerminalSession {
         };
         // Typing follows conventional terminal behavior and returns the
         // viewport to the live prompt before the PTY produces more output.
-        if let Err(error) = self
-            .shared
-            .emulator_command(EmulatorCommand::Scroll(ScrollViewport::Bottom))
+        if !self.shared.viewport_is_at_bottom()
+            && let Err(error) = self
+                .shared
+                .emulator_command(EmulatorCommand::Scroll(ScrollViewport::Bottom))
         {
             self.shared.set_status(error);
         }
@@ -745,6 +765,7 @@ struct EmulatorCore {
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
     graphics: PlacementIterator<'static>,
+    previous_images: Vec<TerminalImage>,
     cell_width: u32,
     cell_height: u32,
 }
@@ -796,6 +817,7 @@ impl EmulatorCore {
                 .map_err(|error| format!("could not create Ghostty cell iterator: {error}"))?,
             graphics: PlacementIterator::new()
                 .map_err(|error| format!("could not create Ghostty graphics iterator: {error}"))?,
+            previous_images: Vec::new(),
             cell_width,
             cell_height,
         })
@@ -831,7 +853,9 @@ impl EmulatorCore {
             &mut self.graphics,
             self.cell_width,
             self.cell_height,
+            &self.previous_images,
         )?;
+        self.previous_images = images.clone();
         let scrollbar = self
             .terminal
             .scrollbar()
@@ -861,6 +885,7 @@ impl EmulatorCore {
         };
 
         let mut output = Vec::with_capacity(usize::from(rows) * usize::from(cols));
+        let mut cell_text = String::new();
         let mut row_iter = self
             .rows
             .update(&snapshot)
@@ -876,11 +901,11 @@ impl EmulatorCore {
                 let style = cell
                     .style()
                     .map_err(|error| format!("could not read Ghostty cell style: {error}"))?;
-                let mut text = String::new();
-                cell.graphemes_utf8(&mut text)
+                cell_text.clear();
+                cell.graphemes_utf8(&mut cell_text)
                     .map_err(|error| format!("could not read Ghostty cell text: {error}"))?;
-                if text.is_empty() || style.invisible {
-                    text.push(' ');
+                if cell_text.is_empty() || style.invisible {
+                    cell_text.push(' ');
                 }
                 let wide = cell
                     .raw_cell()
@@ -898,7 +923,7 @@ impl EmulatorCore {
                     std::mem::swap(&mut foreground, &mut background);
                 }
                 output.push(TerminalCell {
-                    text,
+                    text: CompactString::from(cell_text.as_str()),
                     foreground: rgb_value(foreground),
                     background: rgb_value(background),
                     bold: style.bold,
@@ -946,6 +971,7 @@ fn terminal_images(
     iterator: &mut PlacementIterator<'_>,
     cell_width: u32,
     cell_height: u32,
+    previous_images: &[TerminalImage],
 ) -> Result<(Vec<TerminalImage>, Vec<TerminalImagePlacement>), String> {
     let graphics = terminal
         .kitty_graphics()
@@ -974,24 +1000,31 @@ fn terminal_images(
             .generation()
             .map_err(|error| format!("could not read Ghostty image generation: {error}"))?;
         if copied_generations.insert(generation) {
-            let width = image
-                .width()
-                .map_err(|error| format!("could not read Ghostty image width: {error}"))?;
-            let height = image
-                .height()
-                .map_err(|error| format!("could not read Ghostty image height: {error}"))?;
-            let format = image
-                .format()
-                .map_err(|error| format!("could not read Ghostty image format: {error}"))?;
-            let data = image
-                .data()
-                .map_err(|error| format!("could not read Ghostty image pixels: {error}"))?;
-            images.push(TerminalImage {
-                generation,
-                width,
-                height,
-                bgra: image_bgra(format, width, height, data)?.into(),
-            });
+            if let Some(previous) = previous_images
+                .iter()
+                .find(|previous| previous.generation == generation)
+            {
+                images.push(previous.clone());
+            } else {
+                let width = image
+                    .width()
+                    .map_err(|error| format!("could not read Ghostty image width: {error}"))?;
+                let height = image
+                    .height()
+                    .map_err(|error| format!("could not read Ghostty image height: {error}"))?;
+                let format = image
+                    .format()
+                    .map_err(|error| format!("could not read Ghostty image format: {error}"))?;
+                let data = image
+                    .data()
+                    .map_err(|error| format!("could not read Ghostty image pixels: {error}"))?;
+                images.push(TerminalImage {
+                    generation,
+                    width,
+                    height,
+                    bgra: image_bgra(format, width, height, data)?.into(),
+                });
+            }
         }
         image_placements.push(TerminalImagePlacement {
             image_generation: generation,
@@ -1161,7 +1194,7 @@ fn publish_screen(core: &mut EmulatorCore, shared: &SharedTerminal) -> Result<()
         .terminal
         .mode(Mode::DECCKM)
         .map_err(|error| format!("could not read Ghostty cursor mode: {error}"))?;
-    *shared.screen.lock().unwrap() = screen;
+    *shared.screen.lock().unwrap() = Arc::new(screen);
     shared
         .application_cursor
         .store(application_cursor, Ordering::Release);
@@ -1450,8 +1483,8 @@ mod tests {
     use libghostty_vt::terminal::Mode;
 
     use super::{
-        EmulatorCommand, EmulatorCore, SharedTerminal, agent_is_visible, encode_key, encode_paste,
-        image_bgra, indexed_color, resynchronize_terminal_size, terminal_profile,
+        EmulatorCommand, EmulatorCore, SharedTerminal, agent_is_visible, blank_screen, encode_key,
+        encode_paste, image_bgra, indexed_color, resynchronize_terminal_size, terminal_profile,
     };
     use std::sync::Arc;
 
@@ -1496,6 +1529,35 @@ mod tests {
         let shared = SharedTerminal::new(terminal_profile(24, 80, 800, 480));
         assert!(shared.scroll_to_row(10).is_err());
         assert!(!shared.pending_scroll_wakeup.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn terminal_update_events_are_bounded_and_coalesced() {
+        let shared = SharedTerminal::new(terminal_profile(24, 80, 800, 480));
+        let events = shared.update_events.clone();
+
+        shared.bump_revision();
+        shared.bump_revision();
+        shared.bump_revision();
+
+        assert!(events.try_recv().is_ok());
+        assert!(events.try_recv().is_err());
+        assert_eq!(shared.revision.load(Ordering::Acquire), 4);
+    }
+
+    #[test]
+    fn terminal_viewport_bottom_detection_uses_the_latest_snapshot() {
+        let shared = SharedTerminal::new(terminal_profile(24, 80, 800, 480));
+        let mut screen = blank_screen(24, 80);
+        screen.scroll_total = 100;
+        screen.scroll_len = 24;
+        screen.scroll_offset = 76;
+        *shared.screen.lock().unwrap() = Arc::new(screen.clone());
+        assert!(shared.viewport_is_at_bottom());
+
+        screen.scroll_offset = 75;
+        *shared.screen.lock().unwrap() = Arc::new(screen);
+        assert!(!shared.viewport_is_at_bottom());
     }
 
     #[test]
@@ -1624,6 +1686,12 @@ mod tests {
         assert_eq!(screen.image_placements.len(), 1);
         assert_eq!(screen.image_placements[0].pixel_width, 20);
         assert_eq!(screen.image_placements[0].pixel_height, 20);
+
+        let unchanged = core.screen().unwrap();
+        assert!(Arc::ptr_eq(
+            &screen.images[0].bgra,
+            &unchanged.images[0].bgra
+        ));
     }
 
     #[test]

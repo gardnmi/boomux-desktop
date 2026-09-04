@@ -5,8 +5,6 @@ tests, `CONTEXT.md`, architecture documentation, and accepted ADRs.
 
 ## Repository Readiness
 
-- Land and release Boomux's primary-controller backpressure behavior, then state
-  that minimum compatible Boomux version in this repository.
 - Create the `gardnmi/boomux-desktop` remote and connect release automation after
   Linux packaging and smoke-test contracts are defined.
 - Add desktop metadata, icons, and an Omarchy installation/integration path.
