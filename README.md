@@ -79,6 +79,7 @@ The prototype uses Ctrl on Linux so its input reaches the app while it is runnin
 | `Ctrl + F` | Smoothly maximize the focused pane within the main workspace without changing its layout |
 | `Ctrl + W` | Minimize and detach the focused pane, preserving its Boomux Shell and creating a top tab in Tabs layout |
 | `Ctrl + Shift + W` | Permanently remove the selected or focused Boomux Shell |
+| `Ctrl + Page Up/Page Down` | Cycle backward or forward through Workspaces in sidebar order |
 | `Mouse wheel over terminal` | Scroll through retained terminal history |
 | `Shift + Page Up/Page Down` | Scroll terminal history by one viewport, matching Ghostty on Linux |
 | `Shift + Home/End` | Jump to the top or bottom of terminal history |
