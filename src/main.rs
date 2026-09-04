@@ -6,7 +6,7 @@ mod theme;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use boomux::protocol::AgentState;
 use gpui::{
@@ -86,6 +86,8 @@ actions!(
         RemoveShell,
         CopySelection,
         PasteClipboard,
+        ToggleLayoutMode,
+        ExitLayoutMode,
     ]
 );
 
@@ -191,11 +193,8 @@ const KEY_TOGGLE_SIDEBAR: &str = "f6";
 const KEY_NEW_PANE: &str = "secondary-enter";
 const KEY_DETACH_PANE: &str = "secondary-w";
 const KEY_REMOVE_SHELL: &str = "secondary-shift-w";
-const KEY_TOGGLE_FLOATING: &str = "secondary-o";
-const KEY_TOGGLE_FULLSCREEN: &str = "secondary-f";
-const KEY_TOGGLE_SIDEBAR_DRAWER: &str = "secondary-b";
-const KEY_NEXT_WORKSPACE: &str = "secondary-pagedown";
-const KEY_PREVIOUS_WORKSPACE: &str = "secondary-pageup";
+const KEY_TOGGLE_LAYOUT_MODE: &str = "ctrl-space";
+const LAYOUT_LEADER_PASSTHROUGH_WINDOW: Duration = Duration::from_millis(500);
 
 const HELP_SHORTCUTS: &[ShortcutSpec] = &[
     ShortcutSpec {
@@ -210,8 +209,8 @@ const HELP_SHORTCUTS: &[ShortcutSpec] = &[
     },
     ShortcutSpec {
         section: ShortcutSection::Navigation,
-        keys: "Ctrl + Arrow / H J K L",
-        description: "Focus an adjacent pane or enter the sidebar",
+        keys: "Ctrl + Space",
+        description: "Enter/leave Layout mode; press twice to pass through",
     },
     ShortcutSpec {
         section: ShortcutSection::Navigation,
@@ -220,17 +219,22 @@ const HELP_SHORTCUTS: &[ShortcutSpec] = &[
     },
     ShortcutSpec {
         section: ShortcutSection::Navigation,
-        keys: "Ctrl + Tab / Ctrl + Shift + Tab",
+        keys: "Layout: Arrow / H J K L",
+        description: "Focus an adjacent pane",
+    },
+    ShortcutSpec {
+        section: ShortcutSection::Navigation,
+        keys: "Layout: Tab / Shift + Tab",
         description: "Cycle panes forward or backward",
     },
     ShortcutSpec {
         section: ShortcutSection::Navigation,
-        keys: "Ctrl + Page Up / Page Down",
+        keys: "Layout: Page Up / Page Down",
         description: "Cycle Workspaces in sidebar order",
     },
     ShortcutSpec {
         section: ShortcutSection::Navigation,
-        keys: "Ctrl + B",
+        keys: "Layout: B",
         description: "Open or close the sidebar drawer",
     },
     ShortcutSpec {
@@ -250,47 +254,47 @@ const HELP_SHORTCUTS: &[ShortcutSpec] = &[
     },
     ShortcutSpec {
         section: ShortcutSection::Panes,
-        keys: "Ctrl + O",
+        keys: "Layout: O",
         description: "Toggle tiled or floating",
     },
     ShortcutSpec {
         section: ShortcutSection::Panes,
-        keys: "Ctrl + F",
+        keys: "Layout: F",
         description: "Maximize within the workspace",
     },
     ShortcutSpec {
         section: ShortcutSection::Panes,
-        keys: "Ctrl + Shift + Arrow / H J K L",
+        keys: "Layout: Shift + Arrow / H J K L",
         description: "Move or swap the focused pane",
     },
     ShortcutSpec {
         section: ShortcutSection::Panes,
-        keys: "Ctrl + Alt + H J K L",
+        keys: "Layout: Alt + H J K L",
         description: "Resize the focused pane precisely",
     },
     ShortcutSpec {
         section: ShortcutSection::Panes,
-        keys: "Ctrl + Alt + Arrow",
+        keys: "Layout: Alt + Arrow",
         description: "Resize the focused pane",
     },
     ShortcutSpec {
         section: ShortcutSection::Panes,
-        keys: "Ctrl + Alt + Shift + H J K L",
+        keys: "Layout: Alt + Shift + H J K L",
         description: "Resize the focused pane by a large step",
     },
     ShortcutSpec {
         section: ShortcutSection::Panes,
-        keys: "Ctrl + Alt + S / E / R",
+        keys: "Layout: S / E / R",
         description: "Rotate, equalize, or swap the nearest split",
     },
     ShortcutSpec {
         section: ShortcutSection::Panes,
-        keys: "Ctrl + Alt + Shift + Arrow",
+        keys: "Layout: Alt + Shift + Arrow",
         description: "Align a floating pane to a canvas edge",
     },
     ShortcutSpec {
         section: ShortcutSection::Panes,
-        keys: "Ctrl + Alt + C",
+        keys: "Layout: C",
         description: "Center a floating pane",
     },
     ShortcutSpec {
@@ -1198,6 +1202,39 @@ fn scrollbar_fade_opacity(visible: bool, progress: f32) -> f32 {
     if visible { progress } else { 1.0 - progress }
 }
 
+fn layout_leader_passes_through(elapsed: Duration) -> bool {
+    elapsed <= LAYOUT_LEADER_PASSTHROUGH_WINDOW
+}
+
+fn contrast_foreground(background: u32) -> u32 {
+    let red = (background >> 16) & 0xff;
+    let green = (background >> 8) & 0xff;
+    let blue = background & 0xff;
+    if red * 299 + green * 587 + blue * 114 > 150 * 1_000 {
+        0x111111
+    } else {
+        0xffffff
+    }
+}
+
+fn workspace_key_context(
+    help_open: bool,
+    navigation_region: NavigationRegion,
+    layout_mode: bool,
+) -> &'static str {
+    if help_open {
+        "Help"
+    } else if navigation_region == NavigationRegion::Sidebar && layout_mode {
+        "SidebarLayout"
+    } else if navigation_region == NavigationRegion::Sidebar {
+        "Sidebar"
+    } else if layout_mode {
+        "Layout"
+    } else {
+        "Terminal"
+    }
+}
+
 fn desktop_window_title(workspace_name: Option<&str>) -> String {
     workspace_name.map_or_else(
         || "Boomux Desktop".into(),
@@ -1254,6 +1291,8 @@ struct Workspace {
     settings_open: bool,
     help_open: bool,
     help_scroll_handle: ScrollHandle,
+    layout_mode: bool,
+    layout_mode_entered_at: Option<Instant>,
     terminal_pressed_keys: HashMap<String, usize>,
     terminals: HashMap<usize, TerminalPane>,
     next_id: usize,
@@ -1395,6 +1434,8 @@ impl Workspace {
             settings_open: false,
             help_open: false,
             help_scroll_handle,
+            layout_mode: false,
+            layout_mode_entered_at: None,
             terminal_pressed_keys: HashMap::new(),
             terminals,
             next_id: 2,
@@ -1787,6 +1828,61 @@ impl Workspace {
         } else {
             self.enter_sidebar(window, cx);
         }
+    }
+
+    fn toggle_layout_mode(
+        &mut self,
+        _: &ToggleLayoutMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.layout_mode {
+            let pass_through = self
+                .layout_mode_entered_at
+                .is_some_and(|entered| layout_leader_passes_through(entered.elapsed()));
+            self.layout_mode = false;
+            self.layout_mode_entered_at = None;
+            if pass_through {
+                let leader = gpui::Keystroke {
+                    key: "space".into(),
+                    key_char: None,
+                    modifiers: gpui::Modifiers {
+                        control: true,
+                        ..Default::default()
+                    },
+                };
+                if let Some(terminal) = self
+                    .terminals
+                    .get(&self.focused)
+                    .and_then(|pane| pane.session.as_ref())
+                {
+                    terminal.send_key(&leader, libghostty_vt::key::Action::Press);
+                    terminal.send_key(&leader, libghostty_vt::key::Action::Release);
+                }
+            }
+        } else {
+            self.layout_mode = true;
+            self.layout_mode_entered_at = Some(Instant::now());
+            window.focus(&self.focus_handle, cx);
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn exit_layout_mode(
+        &mut self,
+        _: &ExitLayoutMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        // Keep the Layout context active through this key's raw event so the
+        // Escape used to leave the mode is not also forwarded to the PTY.
+        cx.defer_in(window, |this, _, cx| {
+            this.layout_mode = false;
+            this.layout_mode_entered_at = None;
+            cx.notify();
+        });
     }
 
     fn toggle_sidebar_drawer(
@@ -2770,6 +2866,52 @@ impl Workspace {
         {
             return;
         }
+        self.begin_pointer_interaction_focus(id, window, cx);
+
+        if !event.modifiers.control || self.fullscreen == Some(id) {
+            cx.notify();
+            return;
+        }
+
+        let operation = match event.button {
+            MouseButton::Left => PointerOperation::Move,
+            MouseButton::Right => PointerOperation::Resize,
+            _ => return,
+        };
+        self.start_pointer_drag(id, operation, event, cx);
+    }
+
+    fn begin_heading_drag(
+        &mut self,
+        id: usize,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left {
+            return;
+        }
+        if self
+            .workspace_transition
+            .as_ref()
+            .is_some_and(|transition| transition.outgoing.iter().any(|outgoing| outgoing.id == id))
+        {
+            return;
+        }
+        self.begin_pointer_interaction_focus(id, window, cx);
+        if self.fullscreen == Some(id) {
+            cx.stop_propagation();
+            return;
+        }
+        self.start_pointer_drag(id, PointerOperation::Move, event, cx);
+    }
+
+    fn begin_pointer_interaction_focus(
+        &mut self,
+        id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.floating_animation = None;
         self.focused = id;
         self.raise_floating_pane(id);
@@ -2782,17 +2924,15 @@ impl Workspace {
         {
             terminal.focus();
         }
+    }
 
-        if !event.modifiers.control || self.fullscreen == Some(id) {
-            cx.notify();
-            return;
-        }
-
-        let operation = match event.button {
-            MouseButton::Left => PointerOperation::Move,
-            MouseButton::Right => PointerOperation::Resize,
-            _ => return,
-        };
+    fn start_pointer_drag(
+        &mut self,
+        id: usize,
+        operation: PointerOperation,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
         if matches!(operation, PointerOperation::Resize) {
             self.layout_animation = None;
         }
@@ -3607,7 +3747,7 @@ impl Workspace {
                 return;
             }
         }
-        if workspace_keystroke(&event.keystroke) {
+        if desktop_keystroke(&event.keystroke, self.layout_mode) {
             return;
         }
         let sent = pane.session.as_ref().is_some_and(|terminal| {
@@ -4585,7 +4725,7 @@ impl Workspace {
                                 .flex_none()
                                 .text_xs()
                                 .text_color(rgb(0x7f849c))
-                                .child("Ctrl+B"),
+                                .child("Layout B"),
                         ),
                 )
                 .into_any_element()
@@ -6556,6 +6696,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let focused = self.focused == id;
+        let maximized = self.fullscreen == Some(id);
+        let floating = self.floating.iter().any(|pane| pane.id == id);
         let pane = self.terminals.get(&id);
         let title: SharedString = pane.and_then(|pane| pane.session.as_ref()).map_or_else(
             || "Boomux terminals".into(),
@@ -6622,6 +6764,13 @@ impl Workspace {
                         .items_center()
                         .justify_between()
                         .px_3()
+                        .cursor_grab()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event, window, cx| {
+                                this.begin_heading_drag(id, event, window, cx);
+                            }),
+                        )
                         .bg(if focused {
                             gpui::rgb(focused_heading)
                         } else {
@@ -6682,6 +6831,54 @@ impl Workspace {
                                             .child(status),
                                     )
                                 })
+                                .child(
+                                    div()
+                                        .id(("float-pane", id))
+                                        .w(px(28.0))
+                                        .h(px(26.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(0x45475a))
+                                        .text_color(rgb(0xa6adc8))
+                                        .cursor_pointer()
+                                        .hover(|button| button.bg(rgb(0x45475a)))
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.focus_terminal_pane(id, window, cx);
+                                            this.toggle_floating(&ToggleFloating, window, cx);
+                                        }))
+                                        .child(if floating { "↙" } else { "↗" }),
+                                )
+                                .child(
+                                    div()
+                                        .id(("maximize-pane", id))
+                                        .w(px(28.0))
+                                        .h(px(26.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(0x45475a))
+                                        .text_color(rgb(0xa6adc8))
+                                        .cursor_pointer()
+                                        .hover(|button| button.bg(rgb(0x45475a)))
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.focus_terminal_pane(id, window, cx);
+                                            this.toggle_fullscreen(&ToggleFullscreen, window, cx);
+                                        }))
+                                        .child(if maximized { "❐" } else { "□" }),
+                                )
                                 .child(
                                     div()
                                         .id(("minimize-pane", id))
@@ -7173,6 +7370,25 @@ impl Render for Workspace {
             .unwrap_or_default();
 
         let minimized_tabs = self.minimized_tab_strip(cx);
+        let layout_mode_indicator = self.layout_mode.then(|| {
+            let accent = self.theme.accent;
+            div()
+                .absolute()
+                .top(px(8.0))
+                .left(relative(0.5))
+                .ml(px(-58.0))
+                .w(px(116.0))
+                .h(px(24.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(gpui::rgb(accent))
+                .text_color(gpui::rgb(contrast_foreground(accent)))
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child("LAYOUT  ·  ESC")
+        });
         let terminal_area = div()
             .h_full()
             .min_w_0()
@@ -7190,7 +7406,10 @@ impl Render for Workspace {
                     .child(tiled)
                     .children(floating)
                     .children(minimizing)
-                    .children(workspace_leaving),
+                    .children(workspace_leaving)
+                    .when_some(layout_mode_indicator, |element, indicator| {
+                        element.child(indicator)
+                    }),
             );
 
         let target_drawer_width = self.sidebar_width();
@@ -7237,7 +7456,11 @@ impl Render for Workspace {
         div()
             .id("workspace")
             .track_focus(&self.focus_handle)
-            .key_context(if self.help_open { "Help" } else { "Workspace" })
+            .key_context(workspace_key_context(
+                self.help_open,
+                self.navigation_region,
+                self.layout_mode,
+            ))
             .on_action(cx.listener(Self::focus_left))
             .on_action(cx.listener(Self::focus_right))
             .on_action(cx.listener(Self::focus_up))
@@ -7281,6 +7504,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::remove_shell))
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::paste_clipboard))
+            .on_action(cx.listener(Self::toggle_layout_mode))
+            .on_action(cx.listener(Self::exit_layout_mode))
             .on_key_down(cx.listener(Self::terminal_key_down))
             .on_key_up(cx.listener(Self::terminal_key_up))
             .on_mouse_move(cx.listener(Self::on_pointer_move))
@@ -7312,32 +7537,95 @@ impl Render for Workspace {
     }
 }
 
-fn workspace_keystroke(keystroke: &gpui::Keystroke) -> bool {
-    if !keystroke.modifiers.secondary() {
-        return false;
+fn desktop_keystroke(keystroke: &gpui::Keystroke, layout_mode: bool) -> bool {
+    let modifiers = keystroke.modifiers;
+    let no_modifiers = !modifiers.control
+        && !modifiers.alt
+        && !modifiers.shift
+        && !modifiers.platform
+        && !modifiers.function;
+    let only_shift = modifiers.shift
+        && !modifiers.control
+        && !modifiers.alt
+        && !modifiers.platform
+        && !modifiers.function;
+    let only_alt = modifiers.alt
+        && !modifiers.control
+        && !modifiers.shift
+        && !modifiers.platform
+        && !modifiers.function;
+    let alt_shift = modifiers.alt
+        && modifiers.shift
+        && !modifiers.control
+        && !modifiers.platform
+        && !modifiers.function;
+    let only_control = modifiers.control
+        && !modifiers.alt
+        && !modifiers.shift
+        && !modifiers.platform
+        && !modifiers.function;
+    let only_secondary = modifiers.secondary()
+        && !modifiers.alt
+        && !modifiers.shift
+        && !modifiers.function
+        && if cfg!(target_os = "macos") {
+            !modifiers.control
+        } else {
+            !modifiers.platform
+        };
+    let secondary_shift = modifiers.secondary()
+        && modifiers.shift
+        && !modifiers.alt
+        && !modifiers.function
+        && if cfg!(target_os = "macos") {
+            !modifiers.control
+        } else {
+            !modifiers.platform
+        };
+
+    if (no_modifiers && matches!(keystroke.key.as_str(), "f1" | "f2" | "f6"))
+        || (only_control && keystroke.key == "space")
+        || (only_secondary && matches!(keystroke.key.as_str(), "enter" | "w"))
+        || (secondary_shift && matches!(keystroke.key.as_str(), "c" | "v" | "w"))
+        || (only_control && keystroke.key == "insert")
+        || (only_shift && keystroke.key == "insert")
+    {
+        return true;
     }
-    (keystroke.modifiers.shift && matches!(keystroke.key.as_str(), "c" | "v"))
-        || matches!(
-            keystroke.key.as_str(),
-            "h" | "j"
-                | "k"
-                | "l"
-                | "left"
-                | "right"
-                | "up"
-                | "down"
-                | "enter"
-                | "w"
-                | "f"
-                | "s"
-                | "e"
-                | "r"
-                | "c"
-                | "tab"
-                | "pageup"
-                | "pagedown"
-                | "space"
-        )
+
+    layout_mode
+        && ((no_modifiers
+            && matches!(
+                keystroke.key.as_str(),
+                "h" | "j"
+                    | "k"
+                    | "l"
+                    | "left"
+                    | "right"
+                    | "up"
+                    | "down"
+                    | "tab"
+                    | "pageup"
+                    | "pagedown"
+                    | "s"
+                    | "e"
+                    | "r"
+                    | "c"
+                    | "o"
+                    | "f"
+                    | "b"
+                    | "escape"
+            ))
+            || (only_shift
+                && matches!(
+                    keystroke.key.as_str(),
+                    "h" | "j" | "k" | "l" | "left" | "right" | "up" | "down" | "tab"
+                ))
+            || ((only_alt || alt_shift)
+                && matches!(
+                    keystroke.key.as_str(),
+                    "h" | "j" | "k" | "l" | "left" | "right" | "up" | "down"
+                )))
 }
 
 fn append_resource_name(value: &mut String, text: &str) {
@@ -7575,82 +7863,109 @@ fn paint_terminal_images(
 fn main() {
     gpui_platform::application().run(|cx: &mut App| {
         cx.bind_keys([
-            KeyBinding::new("secondary-h", FocusLeft, Some("Workspace")),
-            KeyBinding::new("secondary-l", FocusRight, Some("Workspace")),
-            KeyBinding::new("secondary-k", FocusUp, Some("Workspace")),
-            KeyBinding::new("secondary-j", FocusDown, Some("Workspace")),
-            KeyBinding::new("secondary-left", FocusLeft, Some("Workspace")),
-            KeyBinding::new("secondary-right", FocusRight, Some("Workspace")),
-            KeyBinding::new("secondary-up", FocusUp, Some("Workspace")),
-            KeyBinding::new("secondary-down", FocusDown, Some("Workspace")),
-            KeyBinding::new("secondary-shift-h", MoveLeft, Some("Workspace")),
-            KeyBinding::new("secondary-shift-l", MoveRight, Some("Workspace")),
-            KeyBinding::new("secondary-shift-k", MoveUp, Some("Workspace")),
-            KeyBinding::new("secondary-shift-j", MoveDown, Some("Workspace")),
-            KeyBinding::new("secondary-shift-left", MoveLeft, Some("Workspace")),
-            KeyBinding::new("secondary-shift-right", MoveRight, Some("Workspace")),
-            KeyBinding::new("secondary-shift-up", MoveUp, Some("Workspace")),
-            KeyBinding::new("secondary-shift-down", MoveDown, Some("Workspace")),
-            KeyBinding::new("secondary-alt-h", ResizeSmallLeft, Some("Workspace")),
-            KeyBinding::new("secondary-alt-l", ResizeSmallRight, Some("Workspace")),
-            KeyBinding::new("secondary-alt-k", ResizeSmallUp, Some("Workspace")),
-            KeyBinding::new("secondary-alt-j", ResizeSmallDown, Some("Workspace")),
-            KeyBinding::new("secondary-alt-left", ResizeLeft, Some("Workspace")),
-            KeyBinding::new("secondary-alt-right", ResizeRight, Some("Workspace")),
-            KeyBinding::new("secondary-alt-up", ResizeUp, Some("Workspace")),
-            KeyBinding::new("secondary-alt-down", ResizeDown, Some("Workspace")),
-            KeyBinding::new("secondary-alt-shift-h", ResizeLargeLeft, Some("Workspace")),
-            KeyBinding::new("secondary-alt-shift-l", ResizeLargeRight, Some("Workspace")),
-            KeyBinding::new("secondary-alt-shift-k", ResizeLargeUp, Some("Workspace")),
-            KeyBinding::new("secondary-alt-shift-j", ResizeLargeDown, Some("Workspace")),
+            KeyBinding::new("h", FocusLeft, Some("Layout")),
+            KeyBinding::new("l", FocusRight, Some("Layout")),
+            KeyBinding::new("k", FocusUp, Some("Layout")),
+            KeyBinding::new("j", FocusDown, Some("Layout")),
+            KeyBinding::new("left", FocusLeft, Some("Layout")),
+            KeyBinding::new("right", FocusRight, Some("Layout")),
+            KeyBinding::new("up", FocusUp, Some("Layout")),
+            KeyBinding::new("down", FocusDown, Some("Layout")),
+            KeyBinding::new("shift-h", MoveLeft, Some("Layout")),
+            KeyBinding::new("shift-l", MoveRight, Some("Layout")),
+            KeyBinding::new("shift-k", MoveUp, Some("Layout")),
+            KeyBinding::new("shift-j", MoveDown, Some("Layout")),
+            KeyBinding::new("shift-left", MoveLeft, Some("Layout")),
+            KeyBinding::new("shift-right", MoveRight, Some("Layout")),
+            KeyBinding::new("shift-up", MoveUp, Some("Layout")),
+            KeyBinding::new("shift-down", MoveDown, Some("Layout")),
+            KeyBinding::new("alt-h", ResizeSmallLeft, Some("Layout")),
+            KeyBinding::new("alt-l", ResizeSmallRight, Some("Layout")),
+            KeyBinding::new("alt-k", ResizeSmallUp, Some("Layout")),
+            KeyBinding::new("alt-j", ResizeSmallDown, Some("Layout")),
+            KeyBinding::new("alt-left", ResizeLeft, Some("Layout")),
+            KeyBinding::new("alt-right", ResizeRight, Some("Layout")),
+            KeyBinding::new("alt-up", ResizeUp, Some("Layout")),
+            KeyBinding::new("alt-down", ResizeDown, Some("Layout")),
+            KeyBinding::new("alt-shift-h", ResizeLargeLeft, Some("Layout")),
+            KeyBinding::new("alt-shift-l", ResizeLargeRight, Some("Layout")),
+            KeyBinding::new("alt-shift-k", ResizeLargeUp, Some("Layout")),
+            KeyBinding::new("alt-shift-j", ResizeLargeDown, Some("Layout")),
+            KeyBinding::new("alt-shift-left", AlignFloatingLeft, Some("Layout")),
+            KeyBinding::new("alt-shift-right", AlignFloatingRight, Some("Layout")),
+            KeyBinding::new("alt-shift-up", AlignFloatingUp, Some("Layout")),
+            KeyBinding::new("alt-shift-down", AlignFloatingDown, Some("Layout")),
+            KeyBinding::new("s", ToggleSplit, Some("Layout")),
+            KeyBinding::new("e", EqualizeSplit, Some("Layout")),
+            KeyBinding::new("r", SwapSplit, Some("Layout")),
+            KeyBinding::new("c", CenterFloating, Some("Layout")),
+            KeyBinding::new("tab", CyclePaneNext, Some("Layout")),
+            KeyBinding::new("shift-tab", CyclePanePrevious, Some("Layout")),
+            KeyBinding::new("pagedown", CycleWorkspaceNext, Some("Layout")),
+            KeyBinding::new("pageup", CycleWorkspacePrevious, Some("Layout")),
+            KeyBinding::new("o", ToggleFloating, Some("Layout")),
+            KeyBinding::new("f", ToggleFullscreen, Some("Layout")),
+            KeyBinding::new("b", ToggleSidebarDrawer, Some("Layout")),
+            KeyBinding::new("escape", ExitLayoutMode, Some("Layout")),
+            KeyBinding::new(KEY_TOGGLE_LAYOUT_MODE, ToggleLayoutMode, Some("Terminal")),
+            KeyBinding::new(KEY_TOGGLE_LAYOUT_MODE, ToggleLayoutMode, Some("Layout")),
+            KeyBinding::new(KEY_TOGGLE_LAYOUT_MODE, ToggleLayoutMode, Some("Sidebar")),
             KeyBinding::new(
-                "secondary-alt-shift-left",
-                AlignFloatingLeft,
-                Some("Workspace"),
+                KEY_TOGGLE_LAYOUT_MODE,
+                ToggleLayoutMode,
+                Some("SidebarLayout"),
             ),
-            KeyBinding::new(
-                "secondary-alt-shift-right",
-                AlignFloatingRight,
-                Some("Workspace"),
-            ),
-            KeyBinding::new("secondary-alt-shift-up", AlignFloatingUp, Some("Workspace")),
-            KeyBinding::new(
-                "secondary-alt-shift-down",
-                AlignFloatingDown,
-                Some("Workspace"),
-            ),
-            KeyBinding::new("secondary-alt-s", ToggleSplit, Some("Workspace")),
-            KeyBinding::new("secondary-alt-e", EqualizeSplit, Some("Workspace")),
-            KeyBinding::new("secondary-alt-r", SwapSplit, Some("Workspace")),
-            KeyBinding::new("secondary-alt-c", CenterFloating, Some("Workspace")),
-            KeyBinding::new("secondary-tab", CyclePaneNext, Some("Workspace")),
-            KeyBinding::new("secondary-shift-tab", CyclePanePrevious, Some("Workspace")),
-            KeyBinding::new(KEY_NEXT_WORKSPACE, CycleWorkspaceNext, Some("Workspace")),
-            KeyBinding::new(
-                KEY_PREVIOUS_WORKSPACE,
-                CycleWorkspacePrevious,
-                Some("Workspace"),
-            ),
-            KeyBinding::new(KEY_NEW_PANE, NewPane, Some("Workspace")),
-            KeyBinding::new(KEY_REMOVE_SHELL, RemoveShell, Some("Workspace")),
-            KeyBinding::new(KEY_DETACH_PANE, ClosePane, Some("Workspace")),
-            KeyBinding::new(KEY_TOGGLE_FLOATING, ToggleFloating, Some("Workspace")),
-            KeyBinding::new(KEY_TOGGLE_FULLSCREEN, ToggleFullscreen, Some("Workspace")),
-            KeyBinding::new(
-                KEY_TOGGLE_SIDEBAR_DRAWER,
-                ToggleSidebarDrawer,
-                Some("Workspace"),
-            ),
-            KeyBinding::new(KEY_TOGGLE_HELP, ToggleHelp, Some("Workspace")),
+            KeyBinding::new("right", FocusRight, Some("SidebarLayout")),
+            KeyBinding::new("l", FocusRight, Some("SidebarLayout")),
+            KeyBinding::new("pagedown", CycleWorkspaceNext, Some("SidebarLayout")),
+            KeyBinding::new("pageup", CycleWorkspacePrevious, Some("SidebarLayout")),
+            KeyBinding::new(KEY_NEW_PANE, NewPane, Some("Terminal")),
+            KeyBinding::new(KEY_NEW_PANE, NewPane, Some("Layout")),
+            KeyBinding::new(KEY_NEW_PANE, NewPane, Some("Sidebar")),
+            KeyBinding::new(KEY_NEW_PANE, NewPane, Some("SidebarLayout")),
+            KeyBinding::new(KEY_REMOVE_SHELL, RemoveShell, Some("Terminal")),
+            KeyBinding::new(KEY_REMOVE_SHELL, RemoveShell, Some("Layout")),
+            KeyBinding::new(KEY_REMOVE_SHELL, RemoveShell, Some("Sidebar")),
+            KeyBinding::new(KEY_REMOVE_SHELL, RemoveShell, Some("SidebarLayout")),
+            KeyBinding::new(KEY_DETACH_PANE, ClosePane, Some("Terminal")),
+            KeyBinding::new(KEY_DETACH_PANE, ClosePane, Some("Layout")),
+            KeyBinding::new(KEY_DETACH_PANE, ClosePane, Some("Sidebar")),
+            KeyBinding::new(KEY_DETACH_PANE, ClosePane, Some("SidebarLayout")),
+            KeyBinding::new(KEY_TOGGLE_HELP, ToggleHelp, Some("Terminal")),
+            KeyBinding::new(KEY_TOGGLE_HELP, ToggleHelp, Some("Layout")),
+            KeyBinding::new(KEY_TOGGLE_HELP, ToggleHelp, Some("Sidebar")),
+            KeyBinding::new(KEY_TOGGLE_HELP, ToggleHelp, Some("SidebarLayout")),
             KeyBinding::new(KEY_TOGGLE_HELP, ToggleHelp, Some("Help")),
-            KeyBinding::new(KEY_TOGGLE_SIDEBAR, ToggleSidebarFocus, Some("Workspace")),
-            KeyBinding::new(KEY_RENAME_RESOURCE, RenameResource, Some("Workspace")),
-            KeyBinding::new("secondary-shift-c", CopySelection, Some("Workspace")),
-            KeyBinding::new("secondary-shift-v", PasteClipboard, Some("Workspace")),
+            KeyBinding::new(KEY_TOGGLE_SIDEBAR, ToggleSidebarFocus, Some("Terminal")),
+            KeyBinding::new(KEY_TOGGLE_SIDEBAR, ToggleSidebarFocus, Some("Layout")),
+            KeyBinding::new(KEY_TOGGLE_SIDEBAR, ToggleSidebarFocus, Some("Sidebar")),
+            KeyBinding::new(
+                KEY_TOGGLE_SIDEBAR,
+                ToggleSidebarFocus,
+                Some("SidebarLayout"),
+            ),
+            KeyBinding::new(KEY_RENAME_RESOURCE, RenameResource, Some("Terminal")),
+            KeyBinding::new(KEY_RENAME_RESOURCE, RenameResource, Some("Layout")),
+            KeyBinding::new(KEY_RENAME_RESOURCE, RenameResource, Some("Sidebar")),
+            KeyBinding::new(KEY_RENAME_RESOURCE, RenameResource, Some("SidebarLayout")),
+            KeyBinding::new("secondary-shift-c", CopySelection, Some("Terminal")),
+            KeyBinding::new("secondary-shift-c", CopySelection, Some("Layout")),
+            KeyBinding::new("secondary-shift-c", CopySelection, Some("Sidebar")),
+            KeyBinding::new("secondary-shift-c", CopySelection, Some("SidebarLayout")),
+            KeyBinding::new("secondary-shift-v", PasteClipboard, Some("Terminal")),
+            KeyBinding::new("secondary-shift-v", PasteClipboard, Some("Layout")),
+            KeyBinding::new("secondary-shift-v", PasteClipboard, Some("Sidebar")),
+            KeyBinding::new("secondary-shift-v", PasteClipboard, Some("SidebarLayout")),
             // Omarchy's universal Super+C / Super+V bindings translate terminal
             // clipboard actions to these conventional terminal chords.
-            KeyBinding::new("ctrl-insert", CopySelection, Some("Workspace")),
-            KeyBinding::new("shift-insert", PasteClipboard, Some("Workspace")),
+            KeyBinding::new("ctrl-insert", CopySelection, Some("Terminal")),
+            KeyBinding::new("ctrl-insert", CopySelection, Some("Layout")),
+            KeyBinding::new("ctrl-insert", CopySelection, Some("Sidebar")),
+            KeyBinding::new("ctrl-insert", CopySelection, Some("SidebarLayout")),
+            KeyBinding::new("shift-insert", PasteClipboard, Some("Terminal")),
+            KeyBinding::new("shift-insert", PasteClipboard, Some("Layout")),
+            KeyBinding::new("shift-insert", PasteClipboard, Some("Sidebar")),
+            KeyBinding::new("shift-insert", PasteClipboard, Some("SidebarLayout")),
         ]);
 
         let bounds = Bounds::centered(None, gpui::size(px(1180.0), px(760.0)), cx);
@@ -7736,15 +8051,154 @@ mod pointer_tests {
     }
 
     #[test]
-    fn shift_enter_is_terminal_input_not_a_workspace_shortcut() {
-        assert!(!workspace_keystroke(&gpui::Keystroke {
-            key: "enter".into(),
+    fn shift_enter_and_ctrl_c_remain_terminal_input() {
+        assert!(!desktop_keystroke(
+            &gpui::Keystroke {
+                key: "enter".into(),
+                key_char: None,
+                modifiers: gpui::Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+            },
+            false,
+        ));
+        assert!(!desktop_keystroke(
+            &gpui::Keystroke {
+                key: "c".into(),
+                key_char: Some("c".into()),
+                modifiers: gpui::Modifiers {
+                    control: true,
+                    ..Default::default()
+                },
+            },
+            false,
+        ));
+    }
+
+    #[test]
+    fn layout_commands_are_reserved_only_in_layout_mode() {
+        let left = gpui::Keystroke {
+            key: "left".into(),
+            key_char: None,
+            modifiers: gpui::Modifiers::default(),
+        };
+        let ctrl_left = gpui::Keystroke {
+            modifiers: gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            },
+            ..left.clone()
+        };
+        let leader = gpui::Keystroke {
+            key: "space".into(),
             key_char: None,
             modifiers: gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            },
+        };
+        let copy = gpui::Keystroke {
+            key: "c".into(),
+            key_char: Some("c".into()),
+            modifiers: gpui::Modifiers {
+                control: true,
                 shift: true,
                 ..Default::default()
             },
-        }));
+        };
+
+        assert!(!desktop_keystroke(&left, false));
+        assert!(desktop_keystroke(&left, true));
+        assert!(!desktop_keystroke(&ctrl_left, false));
+        assert!(!desktop_keystroke(&ctrl_left, true));
+        assert!(desktop_keystroke(&leader, false));
+        assert!(desktop_keystroke(&leader, true));
+        assert!(desktop_keystroke(&copy, false));
+        assert!(desktop_keystroke(&copy, true));
+    }
+
+    #[test]
+    fn double_layout_leader_passthrough_has_a_bounded_window() {
+        assert!(layout_leader_passes_through(Duration::ZERO));
+        assert!(layout_leader_passes_through(
+            LAYOUT_LEADER_PASSTHROUGH_WINDOW
+        ));
+        assert!(!layout_leader_passes_through(
+            LAYOUT_LEADER_PASSTHROUGH_WINDOW + Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn sidebar_focus_preserves_layout_mode_with_boundary_navigation() {
+        assert_eq!(
+            workspace_key_context(false, NavigationRegion::Terminal, true),
+            "Layout"
+        );
+        assert_eq!(
+            workspace_key_context(false, NavigationRegion::Sidebar, true),
+            "SidebarLayout"
+        );
+        assert_eq!(
+            workspace_key_context(false, NavigationRegion::Terminal, false),
+            "Terminal"
+        );
+    }
+
+    #[test]
+    fn layout_badge_text_contrasts_with_light_and_dark_accents() {
+        assert_eq!(contrast_foreground(0xf0f0f0), 0x111111);
+        assert_eq!(contrast_foreground(0x202040), 0xffffff);
+    }
+
+    #[test]
+    fn layout_key_binding_spellings_are_valid_gpui_inputs() {
+        for input in [
+            "h",
+            "left",
+            "shift-h",
+            "shift-left",
+            "alt-h",
+            "alt-left",
+            "alt-shift-h",
+            "alt-shift-left",
+            "tab",
+            "shift-tab",
+            "pageup",
+            "pagedown",
+            "ctrl-space",
+        ] {
+            let _ = KeyBinding::new(input, FocusLeft, Some("Layout"));
+        }
+    }
+
+    #[test]
+    fn ordinary_ctrl_letters_are_not_confused_with_modified_desktop_actions() {
+        for key in ["b", "f", "h", "j", "k", "l", "o", "s", "e", "r", "c"] {
+            assert!(!desktop_keystroke(
+                &gpui::Keystroke {
+                    key: key.into(),
+                    key_char: Some(key.into()),
+                    modifiers: gpui::Modifiers {
+                        control: true,
+                        ..Default::default()
+                    },
+                },
+                false,
+            ));
+        }
+
+        assert!(desktop_keystroke(
+            &gpui::Keystroke {
+                key: "enter".into(),
+                key_char: None,
+                modifiers: gpui::Modifiers {
+                    control: true,
+                    ..Default::default()
+                },
+            },
+            false,
+        ));
     }
 
     #[test]

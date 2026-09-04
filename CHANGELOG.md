@@ -4,6 +4,9 @@ All notable changes to Boomux Desktop will be documented in this file.
 
 ## Unreleased
 
+- Put spatial focus, swapping, resizing, alignment, pane cycling, Workspace
+  cycling, floating, maximize, and drawer commands behind a visibly indicated
+  `Ctrl+Space` Layout mode so ordinary terminal control chords reach the PTY.
 - Keep working-to-idle Agents visibly marked as finished until dismissed, and
   acknowledge durable Boomux attention by exact observation revision.
 - Preserve modified special keys and key actions through Ghostty's
@@ -32,6 +35,10 @@ All notable changes to Boomux Desktop will be documented in this file.
 - Replace pane dimension labels with minimize and close controls. Minimize
   detaches while preserving the Boomux Shell; close opens the existing confirmed
   permanent-removal flow.
+- Add a pane-header maximize/restore control using the same animated,
+  workspace-scoped fullscreen behavior as Layout mode.
+- Make pane headings direct drag handles and add a pane-header control for
+  animated floating and docking.
 - Hide the routine attached label, add rename controls to pane headings and
   minimized tabs, and add explicit overflow navigation to the minimized-tab
   strip.

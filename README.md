@@ -37,7 +37,7 @@ its current terminal attachment. There is no intermediate shell picker.
 
 For development and repeatable terminal integration tests, `BOOMUX_DESKTOP_SHELL_ID=<exact-local-shell-id>` overrides the initial shell selection.
 
-`Ctrl + Enter` creates a new Shell and opens it in a new tile. With terminal focus, it uses the focused terminal's Boomux Workspace. With sidebar focus, it uses the selected Workspace or the parent Workspace of the selected Shell or Agent. New Shells use collision-safe random `adjective-noun` names. The sidebar's `+` button creates a randomly named Workspace with its first randomly named Shell and opens it immediately. In the default single-Workspace pane mode, clicking a Workspace or pressing `Enter` while its row is selected opens its non-minimized Shells and collapses every other Workspace in the sidebar. Shells minimized with `Ctrl + W` remain minimized when switching away and returning to a Workspace. In Mixed mode, clicking a Workspace collapses or expands it without collapsing the others. `Space` also collapses or expands the selected Workspace, and **Open workspace** remains available from its `⋮` menu. Clicking an individual minimized Shell opens only that Shell. `Ctrl + W` and the pane header's minimize button close the focused tile and detach from its Shell; the Shell and its process remain alive in Boomux and can be reopened from the sidebar. The pane header's close button permanently terminates and removes its Boomux Shell. Closing the app itself has the same detach-only behavior, preserving Boomux's normal persistence. Each Workspace row has a `⋮` menu for opening it, creating a Shell, renaming, or permanently removing the Workspace. Each Shell row has a `⋮` menu for renaming or permanently removing that Shell. Destructive operations require confirmation by default; **Confirm removals** in Settings can disable those prompts.
+`Ctrl + Enter` creates a new Shell and opens it in a new tile. With terminal focus, it uses the focused terminal's Boomux Workspace. With sidebar focus, it uses the selected Workspace or the parent Workspace of the selected Shell or Agent. New Shells use collision-safe random `adjective-noun` names. The sidebar's `+` button creates a randomly named Workspace with its first randomly named Shell and opens it immediately. In the default single-Workspace pane mode, clicking a Workspace or pressing `Enter` while its row is selected opens its non-minimized Shells and collapses every other Workspace in the sidebar. Shells minimized with `Ctrl + W` remain minimized when switching away and returning to a Workspace. In Mixed mode, clicking a Workspace collapses or expands it without collapsing the others. `Space` also collapses or expands the selected Workspace, and **Open workspace** remains available from its `⋮` menu. Clicking an individual minimized Shell opens only that Shell. `Ctrl + W` and the pane header's minimize button close the focused tile and detach from its Shell; the Shell and its process remain alive in Boomux and can be reopened from the sidebar. Plain left-drag on a pane heading moves or rearranges it without affecting terminal text selection. The pane heading also provides float/dock, maximize/restore, and close buttons. Maximize uses the same workspace-scoped fullscreen behavior as Layout mode's `F`; close permanently terminates and removes the Boomux Shell. Closing the app itself has the same detach-only behavior, preserving Boomux's normal persistence. Each Workspace row has a `⋮` menu for opening it, creating a Shell, renaming, or permanently removing the Workspace. Each Shell row has a `⋮` menu for renaming or permanently removing that Shell. Destructive operations require confirmation by default; **Confirm removals** in Settings can disable those prompts.
 
 New Workspaces append to the bottom of the desktop's Workspace list. Drag a
 Workspace row in either direction to reorder it; the dragged row follows the
@@ -60,26 +60,24 @@ The prototype uses Ctrl on Linux so its input reaches the app while it is runnin
 | `F1` | Open or close the keyboard-shortcut help menu |
 | `F6` | Move keyboard focus between the sidebar and the active terminal |
 | `F2` | Rename the selected sidebar Workspace/Shell, or the focused terminal's Shell |
-| `Ctrl + B` | Open or close the sidebar drawer |
+| `Ctrl + Space` | Enter or leave Layout mode; press twice quickly to send Ctrl+Space to the terminal |
 | `Ctrl + left drag` | Lift, move, and re-tile a tiled pane |
 | `Ctrl + right drag` | Resize a tiled split or floating pane in both axes |
-| `Ctrl + Arrow keys` or `Ctrl + H/J/K/L` | Focus a spatially adjacent pane; moving left past the terminal layout enters the sidebar |
-| `Ctrl + Tab` or `Ctrl + Shift + Tab` | Cycle focus through panes forward or backward |
-| `Ctrl + Shift + Arrow keys` or `Ctrl + Shift + H/J/K/L` | Slide-swap a tiled pane, or move a floating pane |
-| `Ctrl + Alt + H/J/K/L` | Precisely resize the focused tiled or floating pane |
-| `Ctrl + Alt + Arrow keys` | Resize the focused tiled or floating pane by a normal step |
-| `Ctrl + Alt + Shift + H/J/K/L` | Resize the focused tiled or floating pane by a large step |
-| `Ctrl + Alt + S` | Rotate the nearest split between side-by-side and top/bottom |
-| `Ctrl + Alt + E` | Equalize the nearest split to 50/50 |
-| `Ctrl + Alt + R` | Swap the two branches of the nearest split |
-| `Ctrl + Alt + Shift + Arrow keys` | Align a floating pane to the corresponding canvas edge |
-| `Ctrl + Alt + C` | Center a floating pane |
+| Layout: `Arrow keys` or `H/J/K/L` | Focus a spatially adjacent pane |
+| Layout: `Tab` or `Shift + Tab` | Cycle focus through panes forward or backward |
+| Layout: `Shift + Arrow keys` or `Shift + H/J/K/L` | Slide-swap a tiled pane, or move a floating pane |
+| Layout: `Alt + H/J/K/L` | Precisely resize the focused tiled or floating pane |
+| Layout: `Alt + Arrow keys` | Resize the focused tiled or floating pane by a normal step |
+| Layout: `Alt + Shift + H/J/K/L` | Resize the focused tiled or floating pane by a large step |
+| Layout: `S/E/R` | Rotate, equalize, or swap the nearest split |
+| Layout: `Alt + Shift + Arrow keys` | Align a floating pane to the corresponding canvas edge |
+| Layout: `C` | Center a floating pane |
+| Layout: `O/F/B` | Toggle floating, workspace maximize, or the sidebar drawer |
+| Layout: `Page Up/Page Down` | Cycle backward or forward through Workspaces in sidebar order |
+| Layout: `Escape` | Return to normal terminal input |
 | `Ctrl + Enter` | Create a Boomux Shell in the selected or focused Workspace and open it in a new tile |
-| `Ctrl + O` | Toggle the focused pane between tiled and floating, using a larger centered floating size |
-| `Ctrl + F` | Smoothly maximize the focused pane within the main workspace without changing its layout |
 | `Ctrl + W` | Minimize and detach the focused pane, preserving its Boomux Shell and creating a top tab in Tabs layout |
 | `Ctrl + Shift + W` | Permanently remove the selected or focused Boomux Shell |
-| `Ctrl + Page Up/Page Down` | Cycle backward or forward through Workspaces in sidebar order |
 | `Mouse wheel over terminal` | Scroll through retained terminal history |
 | `Shift + Page Up/Page Down` | Scroll terminal history by one viewport, matching Ghostty on Linux |
 | `Shift + Home/End` | Jump to the top or bottom of terminal history |
@@ -100,8 +98,7 @@ visible rows, `Left`/`Right` or `H`/`L` collapses and expands Workspaces,
 `Enter` opens the selected Workspace or Shell, `Space` toggles a Workspace's
 expanded state, `Ctrl+Enter` creates a Shell in that row's Workspace, `F2`
 renames the selected Workspace or Shell, `Tab` moves between the Workspaces and
-Agents sections, and `Escape` returns to the terminal. `Ctrl+Right` also moves
-spatial focus from the sidebar back to the previously active terminal.
+Agents sections, and `Escape` or `F6` returns to the terminal.
 
 Focus follows the pointer as it moves over panes. Keyboard focus remains in the
 sidebar when the pointer is stationary over a pane and returns to that pane only
@@ -111,8 +108,8 @@ requested drag operation.
 The compact Boomux sidebar header keeps Workspace creation visible and places
 Settings, Keyboard Shortcuts, and Hide Sidebar in its overflow menu. Settings
 opens as a scrollable sidebar screen with consistent segmented and stepper
-controls, and can disable removal confirmations. `Ctrl+B` opens the sidebar
-again after it has been closed.
+controls, and can disable removal confirmations. Layout mode's `B` command opens
+the sidebar again after it has been closed.
 
 On Omarchy, Boomux Desktop follows the active system theme automatically. It
 loads the semantic palette and terminal ANSI colors from
@@ -160,14 +157,17 @@ The **Keyboard shortcuts** overflow item opens the same help menu as `F1`. The m
 
 Attached terminals show a scrollbar on their right edge. Its thumb is derived from libghostty's native `total`, `offset`, and `len` viewport state and can be dragged anywhere in retained history. The scrollbar fades in on hover, remains visible while dragged, fades out after exit, and keeps the normal arrow cursor.
 
-When the Boomux terminal tile is focused, ordinary typing and common control/navigation keys are sent to the shell. The compositor shortcuts above remain owned by the GPUI workspace.
+When a Boomux terminal tile is focused, ordinary typing and common control and
+navigation keys—including `Ctrl+C`, `Ctrl+Arrow`, and `Ctrl+H/J/K/L`—are sent
+to the shell. `Ctrl+Space` enters an explicit Layout mode whose persistent
+on-canvas indicator remains visible until `Escape` or `Ctrl+Space` exits it.
 
-After a small movement threshold, a tiled pane is temporarily lifted into the floating layer and follows the pointer. Neighboring tiles ease into the freed space, and dropping over the left, right, top, or bottom side of another tile animates the pane back into the resulting tiled layout. A modified click without movement does not mutate geometry. Directional focus and swaps prioritize panes sharing the requested edge before falling back to diagonal candidates. Explicitly floating panes remain floating, rise above other floating panes when focused, and are clamped to the panel during keyboard movement and resizing; `Ctrl + O` toggles that persistent mode with an eased grow-and-center transition.
+After a small movement threshold, a tiled pane is temporarily lifted into the floating layer and follows the pointer. Neighboring tiles ease into the freed space, and dropping over the left, right, top, or bottom side of another tile animates the pane back into the resulting tiled layout. A modified click without movement does not mutate geometry. Directional focus and swaps prioritize panes sharing the requested edge before falling back to diagonal candidates. Explicitly floating panes remain floating, rise above other floating panes when focused, and are clamped to the panel during keyboard movement and resizing; Layout mode's `O` command toggles that persistent mode with an eased grow-and-center transition.
 
 Keyboard swaps use the same eased geometry transition, so both affected panes
 slide between their previous and new tiled positions.
 
-Workspace maximize temporarily expands the focused pane over the main terminal canvas while keeping the sidebar and its controls visible. Its tiled position or floating bounds remain unchanged and return with the reverse animation when `Ctrl+F` is pressed again.
+Workspace maximize temporarily expands the focused pane over the main terminal canvas while keeping the sidebar and its controls visible. Its tiled position or floating bounds remain unchanged and return with the reverse animation when Layout mode's `F` command is pressed again.
 
 In Tabs layout, ordinary geometry and focus commands continue to operate on all
 open tiled and floating panes. Tabs consume only the height needed for currently

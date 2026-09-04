@@ -25,6 +25,13 @@ encoding and forwarding them; this keeps Kitty keyboard, modifyOtherKeys,
 cursor, keypad, and backarrow negotiation ordered with terminal output.
 Detaching a pane never implies closing its Boomux Shell.
 
+GPUI key contexts separate ordinary terminal input from desktop layout actions.
+The default `Terminal` context reserves only explicit lifecycle, clipboard, and
+mode-entry commands; other keys reach the pane encoder. `Ctrl+Space` activates
+the `Layout` context, where unmodified navigation keys and their Shift/Alt
+variants manipulate panes until `Escape` exits. The active context is reflected
+by a persistent canvas indicator rather than inferred from the last command.
+
 ## Module Map
 
 - `src/main.rs`: application model, Boomux sidebar projection, input routing,
