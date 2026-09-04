@@ -10,8 +10,6 @@ All notable changes to Boomux Desktop will be documented in this file.
   hot-path work.
 - Slide outgoing and incoming pane sets between Workspaces using the selected
   Fast or Smooth motion speed while keeping Instant switches immediate.
-- Add `Ctrl+PageUp` and `Ctrl+PageDown` shortcuts to cycle through Workspaces in
-  sidebar order with wrapping.
 - Pin the Boomux client to v1.9.5 and document v1.9.3 as the minimum daemon
   version with the primary-output backpressure required for reliable Kitty
   graphics.
