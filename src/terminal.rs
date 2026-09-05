@@ -32,7 +32,10 @@ use libghostty_vt::{RenderState, Terminal as GhosttyTerminal, TerminalOptions};
 use crate::generated_names;
 use crate::theme::TerminalTheme;
 
-const SCROLLBACK_ROWS: usize = 2_000;
+// In the pinned libghostty-vt implementation this is a page-memory budget in
+// bytes, despite the Rust/C API documentation describing it as a line count.
+// Ghostty allocates lazily and may exceed it to accommodate the visible screen.
+const SCROLLBACK_BYTES: usize = 4 * 1024 * 1024;
 const RECONNECT_ATTEMPTS: usize = 80;
 const RECONNECT_DELAY: Duration = Duration::from_millis(25);
 const RESIZE_SETTLE: Duration = Duration::from_millis(100);
@@ -906,7 +909,7 @@ impl EmulatorCore {
             // dimensions; libghostty treats an unchanged cell size as a no-op.
             cols: 1,
             rows: 1,
-            max_scrollback: SCROLLBACK_ROWS,
+            max_scrollback: SCROLLBACK_BYTES,
         })
         .map_err(|error| format!("could not create Ghostty terminal: {error}"))?;
         let theme = shared
@@ -2363,6 +2366,91 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(&lines[..3], ["abcde", "fghij", "klmno"]);
         assert!(lines[3].starts_with('p'));
+    }
+
+    #[test]
+    fn ghostty_retains_history_before_and_after_pane_resize() {
+        for cols in [80, 160, 240] {
+            let shared = Arc::new(SharedTerminal::new(terminal_profile(
+                40,
+                cols,
+                cols * 10,
+                800,
+            )));
+            let mut core = EmulatorCore::new(&shared, 40, cols, cols * 10, 800).unwrap();
+            let output = (0..500)
+                .map(|line| format!("history-{line:04}\r\n"))
+                .collect::<String>();
+            core.apply(EmulatorCommand::Output(output.into_bytes()))
+                .unwrap();
+            for width in [cols, cols / 2, cols] {
+                core.apply(EmulatorCommand::Resize {
+                    rows: 40,
+                    cols: width,
+                    cell_width: 10,
+                    cell_height: 20,
+                })
+                .unwrap();
+                core.apply(EmulatorCommand::Scroll(
+                    libghostty_vt::terminal::ScrollViewport::Top,
+                ))
+                .unwrap();
+                let screen = core.screen().unwrap();
+                assert!(
+                    screen.scroll_total >= 501,
+                    "{cols} initial columns, {width} current: only {} total rows retained",
+                    screen.scroll_total
+                );
+                let first_row = screen.cells[..usize::from(screen.cols)]
+                    .iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<String>();
+                assert!(first_row.starts_with("history-0000"), "{first_row:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn ghostty_scrollback_prunes_old_output_when_the_budget_is_full() {
+        let shared = Arc::new(SharedTerminal::new(terminal_profile(40, 160, 1600, 800)));
+        let mut core = EmulatorCore::new(&shared, 40, 160, 1600, 800).unwrap();
+        let output = (0..20_000)
+            .map(|line| format!("history-{line:05}\r\n"))
+            .collect::<String>();
+        core.apply(EmulatorCommand::Output(output.into_bytes()))
+            .unwrap();
+        core.apply(EmulatorCommand::Scroll(
+            libghostty_vt::terminal::ScrollViewport::Top,
+        ))
+        .unwrap();
+        let oldest = core.screen().unwrap();
+        assert!(oldest.scroll_total > 500);
+        assert!(
+            oldest.scroll_total < 20_001,
+            "history must not grow without a bound"
+        );
+        let first_row = oldest.cells[..usize::from(oldest.cols)]
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<String>();
+        assert!(
+            !first_row.starts_with("history-00000"),
+            "old output must be pruned"
+        );
+        core.apply(EmulatorCommand::Scroll(
+            libghostty_vt::terminal::ScrollViewport::Bottom,
+        ))
+        .unwrap();
+        let newest = core.screen().unwrap();
+        let text = newest
+            .cells
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<String>();
+        assert!(
+            text.contains("history-19999"),
+            "newest output must remain available"
+        );
     }
 
     #[test]

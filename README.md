@@ -186,6 +186,11 @@ The **Keyboard shortcuts** overflow item opens the same help menu as `F1`. The m
 
 Attached terminals show a scrollbar on their right edge. Its thumb is derived from libghostty's native `total`, `offset`, and `len` viewport state and can be dragged anywhere in retained history. The scrollbar fades in on hover, remains visible while dragged, fades out after exit, and keeps the normal arrow cursor.
 
+Each pane gives Ghostty a 4 MiB page-memory budget for the primary screen and
+scrollback. History is allocated as output arrives; the number of retained
+lines varies with terminal width and cell contents. This is separate from
+Boomux's durable Shell history and reconstruction on attachment.
+
 When a Boomux terminal tile is focused, ordinary typing and common control and
 navigation keys—including `Ctrl+C`, `Ctrl+Arrow`, and `Ctrl+H/J/K/L`—are sent
 to the shell. `Ctrl+Space` enters an explicit Layout mode whose persistent

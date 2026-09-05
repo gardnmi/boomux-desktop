@@ -59,7 +59,11 @@ must also track the number and byte size of live image generations.
 - Ghostty's Kitty image storage is capped at 64 MiB per pane. This is a safety
   ceiling, not a desired steady-state footprint; a global or workload-sensitive
   budget should replace it if measurements show poor multi-pane scaling.
-- Scrollback is capped at 2,000 rows per pane.
+- Each pane uses a 4 MiB Ghostty primary-screen page-memory budget, allocated
+  lazily. The pinned API calls this a line count, but its implementation uses
+  bytes. Retained row count depends on width and cell contents. This is not a
+  total pane RSS cap: Ghostty can exceed it for the visible screen and has
+  additional bookkeeping overhead. Closing the pane releases its terminal.
 - GPU image generations are retained only while referenced by the current screen
   and are dropped explicitly afterward.
 - Overview refresh and Boomux requests stay off the render path.

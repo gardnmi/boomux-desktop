@@ -4,6 +4,9 @@ All notable changes to Boomux Desktop will be documented in this file.
 
 ## Unreleased
 
+- Fix prematurely truncated terminal scrollback by supplying a byte budget to
+  the pinned Ghostty implementation instead of treating its limit as a row count.
+
 - Put spatial focus, swapping, resizing, alignment, pane cycling, Workspace
   cycling, floating, maximize, and drawer commands behind a visibly indicated
   `Ctrl+Space` Layout mode so ordinary terminal control chords reach the PTY.
