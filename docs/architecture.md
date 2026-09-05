@@ -29,8 +29,12 @@ GPUI key contexts separate ordinary terminal input from desktop layout actions.
 The default `Terminal` context reserves only explicit lifecycle, clipboard, and
 mode-entry commands; other keys reach the pane encoder. `Ctrl+Space` activates
 the `Layout` context, where unmodified navigation keys and their Shift/Alt
-variants manipulate panes until `Escape` exits. The active context is reflected
-by a persistent canvas indicator rather than inferred from the last command.
+variants manipulate panes until `Escape` exits. Layout mode blocks new terminal
+key presses, repeats, paste, and mouse-wheel reports; releases for keys already
+sent still reach their original pane. Double `Ctrl+Space` retains its explicit
+pass-through behavior. Output processing continues while each visible pane
+shows a dimming overlay and animated tile icon. Overlay removal shares the
+badge’s single cancelable exit task; it does not delay restoring input.
 
 ## Module Map
 

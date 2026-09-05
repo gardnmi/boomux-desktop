@@ -92,13 +92,14 @@ The prototype uses Ctrl on Linux so its input reaches the app while it is runnin
 | `Ctrl + Space` | Enter or leave Layout mode; press twice quickly to send Ctrl+Space to the terminal |
 | `Ctrl + left drag` | Lift, move, and re-tile a tiled pane |
 | `Ctrl + right drag` | Resize a tiled split or floating pane in both axes |
-| Layout: `Arrow keys` or `H/J/K/L` | Focus a spatially adjacent pane |
+| Layout: `Arrow keys` | Focus a spatially adjacent pane (`H/K/L` also focus left/up/right) |
 | Layout: `Tab` or `Shift + Tab` | Cycle focus through panes forward or backward |
 | Layout: `Shift + Arrow keys` or `Shift + H/J/K/L` | Slide-swap a tiled pane, or move a floating pane |
 | Layout: `Alt + H/J/K/L` | Precisely resize the focused tiled or floating pane |
 | Layout: `Alt + Arrow keys` | Resize the focused tiled or floating pane by a normal step |
 | Layout: `Alt + Shift + H/J/K/L` | Resize the focused tiled or floating pane by a large step |
-| Layout: `S/E/R` | Rotate, equalize, or swap the nearest split |
+| Layout: `J` or `S` | Toggle the nearest split between horizontal and vertical, like Omarchy’s `Super + J` |
+| Layout: `E/R` | Equalize or swap the nearest split |
 | Layout: `Alt + Shift + Arrow keys` | Align a floating pane to the corresponding canvas edge |
 | Layout: `C` | Center a floating pane |
 | Layout: `O/F/B` | Toggle floating, workspace maximize, or the sidebar drawer |
@@ -195,6 +196,13 @@ When a Boomux terminal tile is focused, ordinary typing and common control and
 navigation keys—including `Ctrl+C`, `Ctrl+Arrow`, and `Ctrl+H/J/K/L`—are sent
 to the shell. `Ctrl+Space` enters an explicit Layout mode whose persistent
 on-canvas indicator remains visible until `Escape` or `Ctrl+Space` exits it.
+The indicator's four tiles spring into place, gently pulse while the mode is
+active, and fold together on exit. Focus changes and animated layout actions
+replay the tile assembly. It follows the Motion setting; Instant uses a static
+badge. Each visible pane dims its terminal contents and shows the animated tile
+logo in its center. While Layout mode is active, typing, paste, and terminal
+mouse-wheel input are blocked; output continues updating. Exiting immediately
+restores input while the overlay fades away.
 
 After a small movement threshold, a tiled pane is temporarily lifted into the floating layer and follows the pointer. Neighboring tiles ease into the freed space, and dropping over the left, right, top, or bottom side of another tile animates the pane back into the resulting tiled layout. A modified click without movement does not mutate geometry. Directional focus and swaps prioritize panes sharing the requested edge before falling back to diagonal candidates. Explicitly floating panes remain floating, rise above other floating panes when focused, and are clamped to the panel during keyboard movement and resizing; Layout mode's `O` command toggles that persistent mode with an eased grow-and-center transition.
 

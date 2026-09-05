@@ -1,5 +1,6 @@
 mod generated_names;
 mod layout;
+mod layout_badge;
 mod terminal;
 mod theme;
 
@@ -219,7 +220,7 @@ const HELP_SHORTCUTS: &[ShortcutSpec] = &[
     },
     ShortcutSpec {
         section: ShortcutSection::Navigation,
-        keys: "Layout: Arrow / H J K L",
+        keys: "Layout: Arrow keys",
         description: "Focus an adjacent pane",
     },
     ShortcutSpec {
@@ -284,8 +285,13 @@ const HELP_SHORTCUTS: &[ShortcutSpec] = &[
     },
     ShortcutSpec {
         section: ShortcutSection::Panes,
-        keys: "Layout: S / E / R",
-        description: "Rotate, equalize, or swap the nearest split",
+        keys: "Layout: J (or S)",
+        description: "Toggle nearest split horizontal/vertical",
+    },
+    ShortcutSpec {
+        section: ShortcutSection::Panes,
+        keys: "Layout: E / R",
+        description: "Equalize or swap the nearest split",
     },
     ShortcutSpec {
         section: ShortcutSection::Panes,
@@ -1293,6 +1299,9 @@ struct Workspace {
     help_scroll_handle: ScrollHandle,
     layout_mode: bool,
     layout_mode_entered_at: Option<Instant>,
+    layout_badge_generation: u64,
+    layout_badge_exiting: bool,
+    layout_badge_cleanup: Option<gpui::Task<()>>,
     terminal_pressed_keys: HashMap<String, usize>,
     terminals: HashMap<usize, TerminalPane>,
     next_id: usize,
@@ -1436,6 +1445,9 @@ impl Workspace {
             help_scroll_handle,
             layout_mode: false,
             layout_mode_entered_at: None,
+            layout_badge_generation: 0,
+            layout_badge_exiting: false,
+            layout_badge_cleanup: None,
             terminal_pressed_keys: HashMap::new(),
             terminals,
             next_id: 2,
@@ -1840,8 +1852,7 @@ impl Workspace {
             let pass_through = self
                 .layout_mode_entered_at
                 .is_some_and(|entered| layout_leader_passes_through(entered.elapsed()));
-            self.layout_mode = false;
-            self.layout_mode_entered_at = None;
+            self.leave_layout_mode(cx);
             if pass_through {
                 let leader = gpui::Keystroke {
                     key: "space".into(),
@@ -1861,12 +1872,34 @@ impl Workspace {
                 }
             }
         } else {
+            self.layout_badge_cleanup = None;
+            self.layout_badge_exiting = false;
+            self.layout_badge_generation = self.layout_badge_generation.wrapping_add(1);
             self.layout_mode = true;
             self.layout_mode_entered_at = Some(Instant::now());
             window.focus(&self.focus_handle, cx);
         }
         cx.stop_propagation();
         cx.notify();
+    }
+
+    fn leave_layout_mode(&mut self, cx: &mut Context<Self>) {
+        self.layout_mode = false;
+        self.layout_mode_entered_at = None;
+        self.layout_badge_cleanup = None;
+        self.layout_badge_exiting = false;
+        if let Some(duration) = self.motion_speed.duration() {
+            self.layout_badge_exiting = true;
+            // One pane-independent task, canceled on re-entry or when the app closes.
+            self.layout_badge_cleanup = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(duration).await;
+                this.update(cx, |this, cx| {
+                    this.layout_badge_exiting = false;
+                    cx.notify();
+                })
+                .ok();
+            }));
+        }
     }
 
     fn exit_layout_mode(
@@ -1879,8 +1912,7 @@ impl Workspace {
         // Keep the Layout context active through this key's raw event so the
         // Escape used to leave the mode is not also forwarded to the PTY.
         cx.defer_in(window, |this, _, cx| {
-            this.layout_mode = false;
-            this.layout_mode_entered_at = None;
+            this.leave_layout_mode(cx);
             cx.notify();
         });
     }
@@ -3006,7 +3038,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.pointer_drag.is_some() {
+        if self.layout_mode || self.pointer_drag.is_some() {
             return;
         }
 
@@ -3210,6 +3242,10 @@ impl Workspace {
     }
 
     fn paste_into_focused(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.layout_mode {
+            cx.stop_propagation();
+            return;
+        }
         let pasted = self
             .terminals
             .get(&self.focused)
@@ -3748,6 +3784,10 @@ impl Workspace {
             }
         }
         if desktop_keystroke(&event.keystroke, self.layout_mode) {
+            return;
+        }
+        if self.layout_mode {
+            cx.stop_propagation();
             return;
         }
         let sent = pane.session.as_ref().is_some_and(|terminal| {
@@ -6938,6 +6978,8 @@ impl Workspace {
             .child(
                 div()
                     .id(("terminal-interaction", id))
+                    .relative()
+                    .overflow_hidden()
                     .flex_1()
                     .min_h_0()
                     .on_drag(
@@ -6954,7 +6996,21 @@ impl Workspace {
                     )
                     .on_drag_move(cx.listener(Self::drag_terminal_selection))
                     .on_mouse_down(MouseButton::Middle, cx.listener(Self::paste_primary))
-                    .child(self.boomux_body(id, cx)),
+                    .child(self.boomux_body(id, cx))
+                    .when(
+                        self.layout_mode
+                            || (self.layout_badge_exiting
+                                && self.motion_speed.duration().is_some()),
+                        |body| {
+                            body.child(layout_badge::render_pane_overlay(
+                                self.theme,
+                                self.motion_speed.duration(),
+                                !self.layout_mode,
+                                self.layout_badge_generation,
+                                (id, self.animation_generation),
+                            ))
+                        },
+                    ),
             )
     }
 
@@ -7370,24 +7426,16 @@ impl Render for Workspace {
             .unwrap_or_default();
 
         let minimized_tabs = self.minimized_tab_strip(cx);
-        let layout_mode_indicator = self.layout_mode.then(|| {
-            let accent = self.theme.accent;
-            div()
-                .absolute()
-                .top(px(8.0))
-                .left(relative(0.5))
-                .ml(px(-58.0))
-                .w(px(116.0))
-                .h(px(24.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded_full()
-                .bg(gpui::rgb(accent))
-                .text_color(gpui::rgb(contrast_foreground(accent)))
-                .text_xs()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .child("LAYOUT  ·  ESC")
+        let layout_mode_indicator = (self.layout_mode
+            || (self.layout_badge_exiting && self.motion_speed.duration().is_some()))
+        .then(|| {
+            layout_badge::render(
+                self.theme,
+                self.motion_speed.duration(),
+                !self.layout_mode,
+                self.layout_badge_generation,
+                (self.focused, self.animation_generation),
+            )
         });
         let terminal_area = div()
             .h_full()
@@ -7866,7 +7914,7 @@ fn main() {
             KeyBinding::new("h", FocusLeft, Some("Layout")),
             KeyBinding::new("l", FocusRight, Some("Layout")),
             KeyBinding::new("k", FocusUp, Some("Layout")),
-            KeyBinding::new("j", FocusDown, Some("Layout")),
+            KeyBinding::new("j", ToggleSplit, Some("Layout")),
             KeyBinding::new("left", FocusLeft, Some("Layout")),
             KeyBinding::new("right", FocusRight, Some("Layout")),
             KeyBinding::new("up", FocusUp, Some("Layout")),
