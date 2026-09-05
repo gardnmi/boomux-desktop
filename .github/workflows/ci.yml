@@ -57,6 +57,7 @@ jobs:
         run: |
           python3 scripts/test-installer.py
           python3 scripts/test-release.py
+          python3 scripts/test-smoke.py
 
   rust:
     name: Rust
@@ -103,6 +104,51 @@ jobs:
         # commits and explicit CI runs instead of every PR update.
         if: ${{ github.event_name != 'pull_request' }}
         run: cargo build --release --locked
+
+      - name: Read pinned Boomux revision
+        if: ${{ github.event_name != 'pull_request' }}
+        id: boomux
+        run: |
+          python3 - <<'PY'
+          import os, tomllib
+          with open('Cargo.toml', 'rb') as source:
+              revision = tomllib.load(source)['dependencies']['boomux']['rev']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              print('revision=' + revision, file=output)
+          PY
+
+      - name: Check out pinned Boomux
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: gardnmi/boomux
+          ref: ${{ steps.boomux.outputs.revision }}
+          path: .release-boomux
+          persist-credentials: false
+
+      - name: Package candidate with Boomux
+        if: ${{ github.event_name != 'pull_request' }}
+        run: |
+          cargo build --release --locked --manifest-path .release-boomux/Cargo.toml --bin boomux
+          sh scripts/package-release.sh .release-boomux
+
+      - name: Upload bundle for display tests
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: boomux-desktop-linux-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  desktop-smoke:
+    if: ${{ github.event_name != 'pull_request' }}
+    needs: rust
+    uses: ./.github/workflows/desktop-smoke.yml
+    with:
+      source-ref: ${{ github.sha }}
 
   dependency-policy:
     name: Dependency policy

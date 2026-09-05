@@ -91,6 +91,7 @@ jobs:
         run: |
           python3 scripts/test-installer.py
           python3 scripts/test-release.py
+          python3 scripts/test-smoke.py
           cargo fmt --all -- --check
           cargo clippy --all-targets --all-features --locked -- -D warnings
           cargo test --locked -- --test-threads=1
@@ -121,3 +122,9 @@ jobs:
             dist/*.sha256
           if-no-files-found: error
           retention-days: 14
+
+  desktop-smoke:
+    needs: linux
+    uses: ./.github/workflows/desktop-smoke.yml
+    with:
+      source-ref: ${{ inputs.source-ref || github.sha }}

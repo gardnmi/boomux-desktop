@@ -86,7 +86,7 @@ revision, builds both projects from a clean checkout with
 - `boomux-desktop-x86_64-unknown-linux-gnu.tar.gz.sha256`
 
 Manual bundle runs upload Actions artifacts only. The Release Please pipeline
-downloads the successful build's artifacts, verifies checksums, uploads both
+waits for the X11 and Wayland smoke jobs to pass, downloads the successful build's artifacts, verifies checksums, uploads both
 assets, and then publishes the completed draft, matching Boomux's sequence.
 Matching uploaded assets are reused on retry; conflicting digests fail instead
 of replacing files. Already published releases are not modified by the helper.
@@ -97,9 +97,12 @@ rebuilds, and retries publication. Dispatching an already published tag does
 not rebuild or overwrite it. If rebuilt bytes differ from an uploaded asset,
 resolve the conflict explicitly instead of replacing assets automatically.
 
-Before merging the first release PR, complete the platform smoke tests below
-and review license/notice requirements. Publication is automatic after the
-configured checks pass; the workflow does not yet perform real GUI smoke tests.
+Publication is automatic after the configured checks, including real GUI smoke
+tests of the candidate bundle, pass. The initial automated platform is Ubuntu
+24.04 x86-64 using virtual displays and Mesa software rendering. Review
+license/notice requirements before the first release. Broader hardware and
+distribution coverage can grow with the project; it does not require owning
+every target machine.
 Drafts are not installable through the public installer. A short domain URL can
 serve the installer later without changing the archive layout.
 
@@ -133,8 +136,38 @@ failure, and unsupported platform/version rejection.
 ordering, matching retries, conflicting assets, corrupt archives, network
 failures, and already published release protection without contacting GitHub.
 
-Before publishing, use the actual release bundle in isolated fresh user
-accounts on the supported distributions, under both Wayland and X11:
+`scripts/smoke-desktop.py` runs the actual archive in a temporary environment:
+
+- Verify its checksum and extract the bundled executables.
+- Start an isolated Xvfb display; for Wayland, start Weston with an X11 backend
+  and an input seat inside that display. Force Mesa software rendering.
+- Launch the packaged launcher in a private runtime and verify it starts Boomux.
+- Require a mapped X11 window or a committed Wayland window frame and callback.
+- Create a pending Shell, launch Desktop with its exact ID, and require a running
+  ShellRun with PTY output.
+- Exit and reopen Desktop, verifying the same ShellRun and daemon survive.
+- Close the fixture Shell, stop its daemon, and terminate owned display/bus
+  processes. Save diagnostic logs and `result.json` in `smoke-results/`.
+
+The harness tests the bundled Boomux revision as Desktop's backend. It does not
+run Boomux's full test suite or replace its own protocol, persistence, Agent,
+Node, or other-client coverage. `scripts/test-smoke.py` checks that crashes,
+missing frames, unrelated cursor buffers, and timeouts cannot satisfy readiness.
+
+To run locally after building a bundle, install the runtime/display dependencies
+listed in `desktop-smoke.yml`, then run either backend:
+
+```sh
+python3 scripts/smoke-desktop.py --backend x11 \
+  --archive dist/boomux-desktop-x86_64-unknown-linux-gnu.tar.gz \
+  --output smoke-results/x11
+```
+
+Use `--backend wayland` for Weston. An optional `--software-driver` selects a
+lavapipe ICD JSON outside the system installation. No current display or daemon
+is used. A private D-Bus has no host service activation directories.
+
+Additional manual or future automated coverage remains useful:
 
 1. Confirm library resolution for both binaries and install with no Boomux or
    development toolchains present.
@@ -147,6 +180,8 @@ accounts on the supported distributions, under both Wayland and X11:
 5. Exercise an incompatible daemon and verify a clear error without an automatic
    stop, restart, or second daemon.
 
-Fixture tests validate installation mechanics, not actual GUI startup or
-cross-distribution compatibility. Record distribution versions, display backend,
-and results with the release before publishing.
+The virtual-display tests are startup and integration checks, not pixel
+comparisons or comprehensive keyboard/mouse tests. They do not prove real GPU
+behavior or all distributions. macOS and Windows checks will be added with
+their corresponding build targets. Record platform and backend when reporting
+additional testing.
