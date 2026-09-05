@@ -848,7 +848,7 @@ pub fn close_shell(shell_id: &str) -> Result<(), String> {
 
 fn terminal_profile(rows: u16, cols: u16, pixel_width: u16, pixel_height: u16) -> TerminalProfile {
     TerminalProfile {
-        term: Some("xterm-ghostty".into()),
+        term: Some("xterm-256color".into()),
         colorterm: Some("truecolor".into()),
         term_program: Some("boomux-desktop".into()),
         term_program_version: Some(env!("CARGO_PKG_VERSION").into()),
@@ -1931,6 +1931,14 @@ mod tests {
         assert!(!agent_is_visible(AgentState::Inactive, false, true));
         assert!(!agent_is_visible(AgentState::Done, false, true));
         assert!(agent_is_visible(AgentState::Done, true, false));
+    }
+
+    #[test]
+    fn terminal_profile_uses_a_portable_term_type() {
+        let profile = terminal_profile(24, 80, 800, 480);
+
+        assert_eq!(profile.term.as_deref(), Some("xterm-256color"));
+        assert_eq!(profile.colorterm.as_deref(), Some("truecolor"));
     }
 
     #[test]
