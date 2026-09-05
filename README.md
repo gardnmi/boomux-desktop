@@ -13,7 +13,36 @@ The layout panes are managed inside one GPUI window, and every pane hosts an ind
 
 An Omarchy Boomux-inspired sidebar presents the local workspace tree, shell status, and current/attention-bearing agents. When an agent settles from working to idle, its row remains marked **finished** until **Dismiss** is clicked; durable Boomux attention is acknowledged with the exact observation revision. Workspace rows expand and collapse. Clicking a shell or agent focuses its existing tile, or attaches its shell in a new tile when it is not already open. The overview refreshes from Boomux in the background without putting daemon requests on the GPUI render path. Nodes and web controls remain outside this proof of concept.
 
-## Run it
+## Install release builds
+
+The Linux installer installs Boomux Desktop and its matching Boomux executable
+together, without sudo or a local Rust/Zig toolchain. Release publishing is not
+live yet; this command becomes usable after the installer is merged and the
+first stable release bundle is published:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gardnmi/boomux-desktop/main/install.sh | sh
+```
+
+The initial release target is Linux x86-64 with glibc, built on Ubuntu 24.04.
+It needs the system's graphics drivers and Fontconfig, Wayland/X11, XCB
+shape/xfixes, and xkbcommon libraries. Older distributions and musl-based
+distributions such as Alpine are not supported by this bundle. macOS, Windows,
+and ARM builds are not provided yet.
+
+Launch `boomux-desktop` after installation. The launcher invokes the bundled
+`boomux daemon start` before opening the window. Boomux reuses a running daemon
+or starts one; closing Desktop leaves the daemon and Shells running.
+
+Commands are linked in `~/.local/bin`. If that directory is absent from your
+PATH, add `export PATH="$HOME/.local/bin:$PATH"` to your shell configuration.
+Rerun the installer to download the latest stable release. Updates switch a
+`current` link without overwriting running executables or restarting the daemon.
+Existing Boomux CLI installations are preserved. See
+[release packaging](docs/releases.md) for version selection, install locations,
+release preparation, and the required platform smoke tests.
+
+## Run from source
 
 ```sh
 cargo run
@@ -194,6 +223,9 @@ minimized Shells and disappear when every tab has been restored.
 The layout model is isolated in `src/layout.rs`; the Boomux lifecycle, attachment, and libghostty terminal adapter live in `src/terminal.rs`.
 
 ## Performance
+
+For automated checks and recommended branch protection, see
+[continuous integration](docs/ci.md).
 
 Boomux Desktop is intended to stay responsive and memory-efficient as humans
 and agents create more terminals than traditional single-user workflows. The

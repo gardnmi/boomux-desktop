@@ -1,0 +1,123 @@
+name: Release bundle
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      source-ref:
+        required: true
+        type: string
+      tag:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.source-ref || github.sha }}
+          persist-credentials: false
+      # Reusable workflows inherit the caller's event. Only successful main
+      # push CI can supply validation; manual builds and recovery validate below.
+      - name: Verify existing CI validation
+        id: ci
+        if: >-
+          ${{ github.event_name == 'workflow_run' &&
+              github.event.workflow_run.name == 'CI' &&
+              github.event.workflow_run.event == 'push' &&
+              github.event.workflow_run.conclusion == 'success' &&
+              github.event.workflow_run.head_repository.full_name == github.repository &&
+              github.event.workflow_run.head_branch == github.event.repository.default_branch }}
+        env:
+          VALIDATED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          source_sha=$(git rev-parse HEAD)
+          if [[ "$source_sha" != "$VALIDATED_SHA" ]]; then
+            printf 'release source %s was not the CI-validated commit %s\n' "$source_sha" "$VALIDATED_SHA" >&2
+            exit 1
+          fi
+          printf 'validated=true\n' >> "$GITHUB_OUTPUT"
+          printf 'Reusing successful CI validation for %s; building and verifying the bundle.\n' "$source_sha" >> "$GITHUB_STEP_SUMMARY"
+      - name: Read pinned Boomux revision and validate tag
+        id: boomux
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import os, tomllib
+          with open('Cargo.toml', 'rb') as source:
+              manifest = tomllib.load(source)
+          if os.environ['RELEASE_TAG']:
+              assert os.environ['RELEASE_TAG'] == 'v' + manifest['package']['version'], 'tag must match Cargo.toml'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              print('revision=' + manifest['dependencies']['boomux']['rev'], file=output)
+          PY
+      - name: Check out pinned Boomux
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: gardnmi/boomux
+          ref: ${{ steps.boomux.outputs.revision }}
+          path: .release-boomux
+          persist-credentials: false
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libfontconfig-dev libwayland-dev libx11-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libxkbcommon-x11-dev
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: Install validation components
+        if: ${{ steps.ci.outputs.validated != 'true' }}
+        run: rustup component add --toolchain stable rustfmt clippy
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.15.2
+      - name: Validate
+        if: ${{ steps.ci.outputs.validated != 'true' }}
+        run: |
+          python3 scripts/test-installer.py
+          python3 scripts/test-release.py
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features --locked -- -D warnings
+          cargo test --locked -- --test-threads=1
+      - name: Audit dependencies
+        if: ${{ steps.ci.outputs.validated != 'true' }}
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      - name: Build and package both executables
+        run: |
+          cargo build --release --locked
+          cargo build --release --locked --manifest-path .release-boomux/Cargo.toml --bin boomux
+          sh scripts/package-release.sh .release-boomux
+      - name: Verify bundle
+        run: |
+          cd dist
+          sha256sum --check boomux-desktop-x86_64-unknown-linux-gnu.tar.gz.sha256
+          mkdir smoke
+          tar -xzf boomux-desktop-x86_64-unknown-linux-gnu.tar.gz -C smoke
+          smoke/bin/boomux --version
+          ldd smoke/libexec/boomux-desktop > linked-libraries.txt
+          cat linked-libraries.txt
+          if grep -q 'not found' linked-libraries.txt; then exit 1; fi
+      - name: Upload reviewable bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: boomux-desktop-linux-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14

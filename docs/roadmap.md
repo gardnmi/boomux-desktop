@@ -5,8 +5,8 @@ tests, `CONTEXT.md`, architecture documentation, and accepted ADRs.
 
 ## Repository Readiness
 
-- Create the `gardnmi/boomux-desktop` remote and connect release automation after
-  Linux packaging and smoke-test contracts are defined.
+- Validate the Linux release bundle on supported distributions and publish the
+  first stable release after the Wayland/X11 smoke tests in `docs/releases.md`.
 - Add desktop metadata, icons, and an Omarchy installation/integration path.
 - Replace the full Boomux Git dependency with a focused published client and
   protocol crate when available.

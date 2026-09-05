@@ -1,6 +1,8 @@
 name: CI
 
 on:
+  workflow_dispatch:
+  merge_group:
   pull_request:
   push:
     branches:
@@ -18,9 +20,48 @@ env:
   RUSTUP_TOOLCHAIN: stable
 
 jobs:
+  checks:
+    name: Quick checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Validate GitHub workflows
+        run: |
+          tool_dir=$(mktemp -d "$RUNNER_TEMP/actionlint.XXXXXXXX")
+          curl -fsSL --retry 3 \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz \
+            -o "$tool_dir/actionlint.tar.gz"
+          printf '023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757  %s\n' \
+            "$tool_dir/actionlint.tar.gz" | sha256sum --check
+          tar -xzf "$tool_dir/actionlint.tar.gz" -C "$tool_dir" actionlint
+          "$tool_dir/actionlint" -shellcheck= -pyflakes=
+
+      - name: Install Rust formatter
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check shell syntax
+        run: |
+          sh -n install.sh
+          sh -n packaging/boomux-desktop
+          sh -n scripts/package-release.sh
+          bash -n scripts/memory-report.sh
+          bash -n scripts/publish-release.sh
+
+      - name: Test installer
+        run: |
+          python3 scripts/test-installer.py
+          python3 scripts/test-release.py
+
   rust:
     name: Rust
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - name: Check out repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -38,15 +79,18 @@ jobs:
             libxkbcommon-x11-dev
 
       - name: Install Rust toolchain
-        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+        run: rustup toolchain install stable --profile minimal --component clippy
 
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.15.2
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          key: ubuntu-24.04-zig-0.15.2
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
@@ -55,11 +99,15 @@ jobs:
         run: cargo test --locked -- --test-threads=1
 
       - name: Build release binary
+        # PRs compile and link tests above. Check optimization on integration
+        # commits and explicit CI runs instead of every PR update.
+        if: ${{ github.event_name != 'pull_request' }}
         run: cargo build --release --locked
 
   dependency-policy:
     name: Dependency policy
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - name: Check out repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
