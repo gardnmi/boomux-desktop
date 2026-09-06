@@ -1,0 +1,180 @@
+name: Release Please
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing draft release tag to rebuild and publish
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+          (github.event.workflow_run.event == 'push' &&
+           github.event.workflow_run.head_repository.full_name == github.repository &&
+           github.event.workflow_run.conclusion == 'success' &&
+           github.event.workflow_run.head_branch == github.event.repository.default_branch) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      release-created: ${{ steps.release.outputs.release_created }}
+      tag-name: ${{ inputs.tag || steps.release.outputs.tag_name }}
+      release-sha: ${{ steps.release.outputs.sha }}
+      source-ref: ${{ steps.dispatch-release.outputs.source-ref || steps.release.outputs.sha }}
+      release-published: ${{ steps.dispatch-release.outputs.published }}
+    steps:
+      - name: Verify triggering CI commit is current
+        if: ${{ github.event_name == 'workflow_run' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          VALIDATED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          current_sha=$(gh api "repos/$GH_REPO/commits/$DEFAULT_BRANCH" --jq .sha)
+          if [[ "$current_sha" != "$VALIDATED_SHA" ]]; then
+            printf 'CI validated %s, but %s is now %s\n' "$VALIDATED_SHA" "$DEFAULT_BRANCH" "$current_sha" >&2
+            exit 1
+          fi
+
+      - name: Check for pending draft release
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.tag == '' }}
+        id: pending-draft
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          draft_ids=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
+            --jq '.[] | select(.draft == true) | .id' \
+            | sed -n '/^[0-9][0-9]*$/p')
+          if [[ -n "$draft_ids" ]]; then
+            printf 'exists=true\n' >> "$GITHUB_OUTPUT"
+            printf 'An unpublished draft release exists; deferring the next release proposal.\n' >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf 'exists=false\n' >> "$GITHUB_OUTPUT"
+          fi
+
+      # A draft created in this run is not discoverable as the latest release.
+      # Keep proposal generation out of the release-creation invocation.
+      - name: Create merged release
+        if: >-
+          ${{ (github.event_name != 'workflow_dispatch' || inputs.tag == '') &&
+              steps.pending-draft.outputs.exists != 'true' }}
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-pull-request: true
+
+      - name: Update release proposal
+        if: >-
+          ${{ (github.event_name != 'workflow_dispatch' || inputs.tag == '') &&
+              steps.pending-draft.outputs.exists != 'true' &&
+              steps.release.outputs.release_created != 'true' }}
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-release: true
+
+      - name: Verify release source passed triggering CI
+        if: ${{ github.event_name == 'workflow_run' && steps.release.outputs.release_created == 'true' }}
+        env:
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+          VALIDATED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          if [[ "$RELEASE_SHA" != "$VALIDATED_SHA" ]]; then
+            printf 'release source %s was not the CI-validated commit %s\n' "$RELEASE_SHA" "$VALIDATED_SHA" >&2
+            exit 1
+          fi
+
+      - name: Resolve dispatched release source
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.tag != '' }}
+        id: dispatch-release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            printf 'release tag must be strict vMAJOR.MINOR.PATCH: %s\n' "$TAG" >&2
+            exit 1
+          fi
+          release_id=$(gh api "repos/$GH_REPO/releases/tags/$TAG" --jq .id 2>/dev/null | sed -n '/^[0-9][0-9]*$/p' || true)
+          if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+            release_id=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq ".[] | select((.tag_name == \"$TAG\") or (.draft == true and .name == \"$TAG\")) | .id" | sed -n '/^[0-9][0-9]*$/p')
+          fi
+          if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+            printf 'could not resolve one release for %s\n' "$TAG" >&2
+            exit 1
+          fi
+          draft=$(gh api "repos/$GH_REPO/releases/$release_id" --jq .draft)
+          if [[ "$draft" == true ]]; then
+            target_commitish=$(gh api "repos/$GH_REPO/releases/$release_id" --jq .target_commitish)
+            source_ref=$(gh api "repos/$GH_REPO/commits/$target_commitish" --jq .sha)
+            gh api --method PATCH "repos/$GH_REPO/releases/$release_id" \
+              -f target_commitish="$source_ref" >/dev/null
+            published=false
+          else
+            source_ref=$TAG
+            published=true
+          fi
+          printf 'source-ref=%s\n' "$source_ref" >> "$GITHUB_OUTPUT"
+          printf 'published=%s\n' "$published" >> "$GITHUB_OUTPUT"
+
+  build-release:
+    needs: release-please
+    if: >-
+      ${{ needs.release-please.outputs.release-created == 'true' ||
+          (inputs.tag != '' && needs.release-please.outputs.release-published != 'true') }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/release.yml
+    with:
+      source-ref: ${{ needs.release-please.outputs.source-ref }}
+      tag: ${{ needs.release-please.outputs.tag-name }}
+
+  publish-release:
+    name: Publish completed release
+    needs: [release-please, build-release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.release-please.outputs.tag-name }}
+      SOURCE_REF: ${{ needs.release-please.outputs.source-ref }}
+    steps:
+      - name: Check out validated release source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ env.SOURCE_REF }}
+          persist-credentials: false
+      - name: Download release bundle
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: boomux-desktop-linux-x86_64
+          path: dist
+      - name: Upload and publish completed bundle
+        run: bash scripts/publish-release.sh "$TAG"

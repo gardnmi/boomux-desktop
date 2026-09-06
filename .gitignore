@@ -1,0 +1,25 @@
+# Build, packaging, and measurement output
+/target/
+/dist/
+/performance-results/
+/smoke-results/
+/.release-boomux/
+
+# Python installer-test caches and local environments
+__pycache__/
+*.pyc
+*.pyo
+/.venv/
+
+# Local configuration; keep shared tool versions and examples versioned
+.env
+.env.*
+!.env.example
+/mise.local.toml
+/.mise.local.toml
+
+# Editor and OS scratch files
+*.swp
+*.swo
+*~
+.DS_Store
