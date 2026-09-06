@@ -5,6 +5,8 @@ import io
 import os
 from pathlib import Path
 import subprocess
+import shutil
+import time
 import tarfile
 import tempfile
 import unittest
@@ -33,6 +35,7 @@ class InstallerTests(unittest.TestCase):
             FIXTURES=str(self.releases),
             BOOMUX_DESKTOP_VERSION="",
             TRACE=str(self.root / "trace"),
+            XDG_DATA_HOME=str(self.root / "data"),
             MOCK_OS="Linux",
             MOCK_ARCH="x86_64",
         )
@@ -66,6 +69,9 @@ else:
             "LICENSE.boomux": b"fixture",
             "release.txt": version.encode(),
         }
+        for path in (ROOT / "packaging/share").rglob("*"):
+            if path.is_file():
+                files[str(path.relative_to(ROOT / "packaging"))] = path.read_bytes()
         with tarfile.open(archive, "w:gz") as tar:
             for name, content in files.items():
                 info = tarfile.TarInfo(name)
@@ -93,6 +99,40 @@ else:
         self.run_installer()
         self.assertEqual((self.install / "current").resolve(), first)
         self.assertFalse(list(self.install.glob(".install.*")))
+        entry = Path(self.env["XDG_DATA_HOME"]) / "applications/org.omarchy.boomux-desktop.desktop"
+        icon = Path(self.env["XDG_DATA_HOME"]) / "icons/hicolor/scalable/apps/org.omarchy.boomux-desktop.svg"
+        self.assertTrue(entry.is_symlink())
+        self.assertTrue(icon.is_file())
+        self.assertIn(f'Exec=/usr/bin/env "{self.install}/current/bin/boomux-desktop"', entry.read_text())
+        if shutil.which("desktop-file-validate"):
+            subprocess.run(["desktop-file-validate", entry], check=True)
+
+    def test_unowned_menu_entry_is_preserved(self):
+        entry = Path(self.env["XDG_DATA_HOME"]) / "applications/org.omarchy.boomux-desktop.desktop"
+        entry.parent.mkdir(parents=True)
+        entry.write_text("user entry")
+        self.run_installer(success=False)
+        self.assertEqual(entry.read_text(), "user entry")
+        self.assertFalse((self.install / "current").exists())
+
+    def test_desktop_exec_escapes_special_path_characters(self):
+        self.install = self.root / 'quote" dollar$ percent% back\\ tick`'
+        self.env["BOOMUX_DESKTOP_INSTALL_DIR"] = str(self.install)
+        self.run_installer()
+        entry = (self.install / "desktop-entry").read_text()
+        expected = str(self.install / "current/bin/boomux-desktop")
+        expected = expected.replace('\\', '\\\\\\\\').replace('"', '\\\\"').replace('$', '\\\\$').replace('`', '\\\\`').replace('%', '%%')
+        self.assertIn(f'Exec=/usr/bin/env "{expected}"', entry)
+        if shutil.which("gio"):
+            self.env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/nonexistent-boomux-test-bus"
+            entry_path = Path(self.env["XDG_DATA_HOME"]) / "applications/org.omarchy.boomux-desktop.desktop"
+            subprocess.run(["gio", "launch", entry_path], env=self.env, check=True)
+            trace = Path(self.env["TRACE"])
+            for _ in range(40):
+                if trace.exists() and len(trace.read_text().splitlines()) == 3:
+                    break
+                time.sleep(0.05)
+            self.assertIn("desktop:v0.1.0:", trace.read_text())
 
     def test_update_retains_previous_release_and_bad_download_preserves_current(self):
         self.run_installer()

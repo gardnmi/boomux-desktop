@@ -20,10 +20,11 @@ mkdir -p "$stage/bin" "$stage/libexec" dist
 install -m755 target/release/boomux-desktop "$stage/libexec/boomux-desktop"
 install -m755 "$boomux_source/target/release/boomux" "$stage/bin/boomux"
 install -m755 packaging/boomux-desktop "$stage/bin/boomux-desktop"
+cp -R packaging/share "$stage/share"
 cp LICENSE "$stage/LICENSE"
 cp "$boomux_source/LICENSE" "$stage/LICENSE.boomux"
 version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
 printf 'boomux-desktop %s\nboomux revision %s\n' "$version" "$revision" > "$stage/release.txt"
 asset=boomux-desktop-x86_64-unknown-linux-gnu.tar.gz
-tar -czf "dist/$asset" -C "$stage" bin libexec LICENSE LICENSE.boomux release.txt
+tar -czf "dist/$asset" -C "$stage" bin libexec share LICENSE LICENSE.boomux release.txt
 (cd dist && sha256sum "$asset" > "$asset.sha256")

@@ -30,7 +30,7 @@ shape/xfixes, and xkbcommon libraries. Older distributions and musl-based
 distributions such as Alpine are not supported by this bundle. macOS, Windows,
 and ARM builds are not provided yet.
 
-Launch `boomux-desktop` after installation. The launcher invokes the bundled
+Launch **Boomux Desktop** from the application menu, or run `boomux-desktop`. The launcher invokes the bundled
 `boomux daemon start` before opening the window. Boomux reuses a running daemon
 or starts one; closing Desktop leaves the daemon and Shells running.
 
@@ -40,7 +40,16 @@ Rerun the installer to download the latest stable release. Updates switch a
 `current` link without overwriting running executables or restarting the daemon.
 Existing Boomux CLI installations are preserved. See
 [release packaging](docs/releases.md) for version selection, install locations,
-release preparation, and the required platform smoke tests.
+release preparation, uninstall instructions, and the required platform smoke tests.
+
+Desktop appearance and behavior preferences save automatically to
+`~/.config/boomux-desktop/settings.toml` (`XDG_CONFIG_HOME` is respected).
+Settings presents one categorized list and saves changes automatically. A single
+restart reminder appears when needed. Finish choosing settings, then
+close the panel to choose **Restart now** or **Later**.
+Restart preserves running shells and commands. Pane arrangements and window
+geometry are not yet saved.
+See [preferences and uninstalling](docs/releases.md#desktop-integration-and-preferences).
 
 ## Run from source
 

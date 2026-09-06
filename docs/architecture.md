@@ -45,6 +45,11 @@ badge’s single cancelable exit task; it does not delay restoring input.
 - `src/terminal.rs`: Boomux discovery/attachment adapter, per-pane terminal
   worker, Ghostty VT state, scrollback, key/paste encoding, and Kitty graphics
   extraction.
+- `src/boomux_settings.rs`: active-layer settings editor and bounded CLI bridge;
+  Boomux retains configuration validation and commit authority.
+- `src/settings.rs`: bounded preference loading, validation, and atomic background
+  saves of Desktop-owned settings; shared Boomux configuration remains separate.
+- `src/layout_badge.rs`: shared animated Layout-mode icons and pane overlays.
 - `src/theme.rs`: bounded Omarchy palette loading, semantic application and
   terminal colors, built-in fallback, and the current-theme filesystem watcher.
 
@@ -110,3 +115,44 @@ Until Boomux publishes a focused client crate, Cargo pins an exact Boomux Git
 revision. This avoids an implicit sibling checkout while keeping compatibility
 reviewable. A future `boomux-client`/`boomux-protocol` crate would reduce desktop
 compile time and dependency surface without moving UI code into Boomux.
+
+## Desktop Preferences
+
+Preferences load before GPUI starts, from the XDG configuration directory.
+Settings changes submit a complete snapshot to a capacity-one channel; a single
+background writer replaces superseded pending snapshots and atomically renames
+completed files. A capacity-one result channel reports failures to Settings.
+Closing the sender drains the final snapshot and terminates the writer; normal
+app shutdown awaits its completion asynchronously within GPUI's shutdown deadline.
+Malformed input is preserved and disables saving for that session. The file is
+capped at 64 KiB. Desktop preferences never contain Boomux configuration.
+
+## Shared Boomux Settings
+
+The settings UI loads the active file selected by `boomux config path`, after
+Boomux validates the layered configuration. Controls show configured values from
+the active file, then the global file, then the pinned Boomux defaults. Daemon
+defaults come from its public library; CLI-only display defaults mirror the
+pinned version and must be reviewed on dependency updates. This is a presentation
+projection, not the running daemon's state. Only edited fields are written.
+The comment-preserving active draft and global fallback are each capped at 1 MiB.
+Text entry is limited to 16 KiB. The UI presents one categorized list with shared control styling.
+
+Each completed edit invokes `boomux config edit` with Desktop as its temporary-file editor.
+The helper runs before GPUI initialization, checks the original active-layer
+snapshot against Boomux's working copy, and writes only the working copy.
+Boomux owns validation, ownership checks, inherited-layer conflict checks, and
+atomic replacement of the live file. Temporary request files are private to the
+user and removed after completion. One load/save may be pending per window.
+CLI waits and pipe reads run off GPUI; coreutils timeout owns the subprocess
+group, including the helper. Completed daemon-setting edits set one restart reminder. Confirmation appears
+when the panel closes or its restart button is clicked, never while choosing
+settings. A save finishing after the panel closes also offers confirmation.
+The bounded worker invokes only `boomux daemon restart` after confirmation, with
+a 30-second outer timeout. Restart uses Boomux's graceful handoff authority.
+A persisted Desktop reminder is cleared only after successful restart; it is
+a UI reminder, not an independent assertion of the daemon's current config. The bundled smoke test exercises creation, save, conflict rejection, and
+owner-side validation failures against the pinned Boomux executable.
+
+The direct `toml_edit` dependency pins the version already present through
+Boomux, enabling preservation of user comments without adding another version.

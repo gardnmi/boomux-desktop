@@ -7,7 +7,7 @@ tests, `CONTEXT.md`, architecture documentation, and accepted ADRs.
 
 - Validate the Linux release bundle on supported distributions and publish the
   first stable release after the Wayland/X11 smoke tests in `docs/releases.md`.
-- Add desktop metadata, icons, and an Omarchy installation/integration path.
+- Replace the temporary application icon with final artwork and refine Omarchy integration.
 - Replace the full Boomux Git dependency with a focused published client and
   protocol crate when available.
 
@@ -23,8 +23,7 @@ tests, `CONTEXT.md`, architecture documentation, and accepted ADRs.
 
 ## Product
 
-- Preserve the current terminal, graphics, input, and tiling proof while moving
-  from fixed demo presentation to durable user configuration.
+- Extend persisted Desktop preferences to window geometry and pane arrangement restoration.
 - Reach feature parity with the essential `omarchy-boomux` Workspace and Agent
   workflows before considering replacement of that client.
 - Add multi-Workspace and multi-monitor presentation without duplicating Boomux

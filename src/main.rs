@@ -1,6 +1,8 @@
+mod boomux_settings;
 mod generated_names;
 mod layout;
 mod layout_badge;
+mod settings;
 mod terminal;
 mod theme;
 
@@ -1295,6 +1297,14 @@ struct Workspace {
     theme_load_generation: u64,
     theme_error: Option<String>,
     settings_open: bool,
+    settings_writer: Option<async_channel::Sender<settings::Settings>>,
+    settings_error: Option<String>,
+    settings_restart_pending: bool,
+    settings_restart_confirm: bool,
+    boomux_settings_snapshot: Option<boomux_settings::Snapshot>,
+    boomux_settings_busy: bool,
+    boomux_settings_message: Option<String>,
+    boomux_setting_input: Option<(usize, String)>,
     help_open: bool,
     help_scroll_handle: ScrollHandle,
     layout_mode: bool,
@@ -1339,7 +1349,12 @@ struct TerminalPaintCache {
 }
 
 impl Workspace {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        saved: settings::Settings,
+        settings_error: Option<String>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
         let (boomux_overview, boomux_error) = match terminal::discover_overview() {
@@ -1424,23 +1439,31 @@ impl Workspace {
             sidebar_menu: None,
             sidebar_header_menu_open: false,
             resource_dialog: None,
-            sidebar_visible: true,
+            sidebar_visible: saved.sidebar_visible,
             drawer_animation_from: None,
             drawer_animation_generation: 0,
-            pane_headings_visible: true,
-            pane_corner_style: PaneCornerStyle::Rounded,
-            pane_gap: 8.0,
-            focus_highlight_strength: 100,
-            motion_speed: MotionSpeed::Smooth,
-            workspace_pane_mode: WorkspacePaneMode::Workspace,
-            pane_layout_mode: PaneLayoutMode::Tiled,
+            pane_headings_visible: saved.pane_headings_visible,
+            pane_corner_style: saved.pane_corner_style,
+            pane_gap: saved.pane_gap,
+            focus_highlight_strength: saved.focus_highlight_strength,
+            motion_speed: saved.motion_speed,
+            workspace_pane_mode: saved.workspace_pane_mode,
+            pane_layout_mode: saved.pane_layout_mode,
             minimized_shells: HashSet::new(),
-            confirm_destructive_actions: true,
+            confirm_destructive_actions: saved.confirm_destructive_actions,
             theme: AppTheme::default(),
             theme_watcher: None,
             theme_load_generation: 0,
             theme_error: None,
             settings_open: false,
+            settings_writer: None,
+            settings_error,
+            settings_restart_pending: saved.settings_restart_pending,
+            settings_restart_confirm: false,
+            boomux_settings_snapshot: None,
+            boomux_settings_busy: false,
+            boomux_settings_message: None,
+            boomux_setting_input: None,
             help_open: false,
             help_scroll_handle,
             layout_mode: false,
@@ -1458,9 +1481,56 @@ impl Workspace {
             let shell_id = shell.id.clone();
             workspace.open_workspace(&workspace_id, Some(&shell_id), window, cx);
         }
+        if workspace.settings_error.is_none()
+            && let Some(path) = settings::path()
+        {
+            let (writer, updates, completion) = settings::writer(path);
+            workspace.settings_writer = Some(writer);
+            cx.on_app_quit(move |this, _| {
+                if let Some(writer) = this.settings_writer.take() {
+                    writer.close();
+                }
+                let completion = completion.clone();
+                async move {
+                    let _ = completion.recv().await;
+                }
+            })
+            .detach();
+            cx.spawn(async move |this, cx| {
+                while let Ok(result) = updates.recv().await {
+                    if this
+                        .update(cx, |this, cx| {
+                            this.settings_error = result.err();
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
         workspace.watch_omarchy_theme(cx);
         workspace.watch_boomux_overview(cx);
         workspace
+    }
+
+    fn save_settings(&self) {
+        if let Some(writer) = &self.settings_writer {
+            let _ = writer.force_send(settings::Settings {
+                sidebar_visible: self.sidebar_visible,
+                pane_headings_visible: self.pane_headings_visible,
+                pane_corner_style: self.pane_corner_style,
+                pane_gap: self.pane_gap,
+                focus_highlight_strength: self.focus_highlight_strength,
+                motion_speed: self.motion_speed,
+                workspace_pane_mode: self.workspace_pane_mode,
+                pane_layout_mode: self.pane_layout_mode,
+                confirm_destructive_actions: self.confirm_destructive_actions,
+                settings_restart_pending: self.settings_restart_pending,
+            });
+        }
     }
 
     fn watch_omarchy_theme(&mut self, cx: &mut Context<Self>) {
@@ -1802,6 +1872,7 @@ impl Workspace {
             self.drawer_animation_from = Some(0.0);
             self.drawer_animation_generation = self.drawer_animation_generation.wrapping_add(1);
             self.sidebar_visible = true;
+            self.save_settings();
             let panel_size = self.panel_size(window);
             for pane in &mut self.floating {
                 *pane = clamp_floating_to_panel(pane.clone(), panel_size);
@@ -1925,6 +1996,7 @@ impl Workspace {
     ) {
         let previous_width = self.sidebar_width();
         self.sidebar_visible = !self.sidebar_visible;
+        self.save_settings();
         self.drawer_animation_generation = self.drawer_animation_generation.wrapping_add(1);
         self.drawer_animation_from = Some(previous_width);
         self.sidebar_menu = None;
@@ -1942,11 +2014,28 @@ impl Workspace {
 
     fn toggle_settings(&mut self, cx: &mut Context<Self>) {
         self.sidebar_header_menu_open = false;
-        self.settings_open = !self.settings_open;
         if self.settings_open {
+            self.close_settings(cx);
+            return;
+        }
+        self.settings_open = true;
+        if self.settings_open {
+            if self.boomux_settings_snapshot.is_none() {
+                self.load_boomux_settings(cx);
+            }
             self.help_open = false;
             self.sidebar_menu = None;
         }
+        cx.notify();
+    }
+
+    fn close_settings(&mut self, cx: &mut Context<Self>) {
+        if !self.settings_open {
+            return;
+        }
+        self.settings_open = false;
+        self.boomux_setting_input = None;
+        self.settings_restart_confirm = self.settings_restart_pending;
         cx.notify();
     }
 
@@ -1971,6 +2060,7 @@ impl Workspace {
                 self.open_workspace(&workspace_id, None, window, cx);
             }
         }
+        self.save_settings();
         self.reconcile_sidebar_item();
         cx.notify();
     }
@@ -1982,7 +2072,7 @@ impl Workspace {
         self.sidebar_header_menu_open = false;
         self.help_open = !self.help_open;
         if self.help_open {
-            self.settings_open = false;
+            self.close_settings(cx);
             self.sidebar_menu = None;
             self.help_scroll_handle.set_offset(point(px(0.0), px(0.0)));
         }
@@ -3219,6 +3309,12 @@ impl Workspace {
 
     fn paste_clipboard(&mut self, _: &PasteClipboard, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            if let Some((_, value)) = &mut self.boomux_setting_input {
+                append_boomux_setting_text(value, &text);
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
             if let Some(ResourceDialog {
                 kind: ResourceDialogKind::Rename,
                 value,
@@ -3242,6 +3338,12 @@ impl Workspace {
     }
 
     fn paste_into_focused(&mut self, text: &str, cx: &mut Context<Self>) {
+        if let Some((_, value)) = &mut self.boomux_setting_input {
+            append_boomux_setting_text(value, text);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if self.layout_mode {
             cx.stop_propagation();
             return;
@@ -3717,6 +3819,18 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.settings_restart_confirm {
+            if event.keystroke.key == "escape" {
+                self.settings_restart_confirm = false;
+                cx.notify();
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if self.boomux_setting_input.is_some() {
+            self.boomux_setting_key_down(event, cx);
+            return;
+        }
         if self.help_open {
             self.help_key_down(event, cx);
             return;
@@ -3726,7 +3840,7 @@ impl Workspace {
             return;
         }
         if self.settings_open && event.keystroke.key == "escape" {
-            self.settings_open = false;
+            self.close_settings(cx);
             cx.stop_propagation();
             cx.notify();
             return;
@@ -4695,28 +4809,6 @@ impl Workspace {
                 )
                 .child(
                     div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0x7f849c))
-                                .child("System theme"),
-                        )
-                        .child(div().text_sm().text_color(rgb(0xcdd6f4)).child(
-                            if self.theme_watcher.is_some() && self.theme_error.is_none() {
-                                "Following Omarchy"
-                            } else {
-                                "Built-in fallback"
-                            },
-                        ))
-                        .when_some(self.theme_error.clone(), |section, error| {
-                            section.child(div().text_xs().text_color(rgb(0xf38ba8)).child(error))
-                        }),
-                )
-                .child(
-                    div()
                         .id("header-menu-help")
                         .h(px(36.0))
                         .px_3()
@@ -5368,67 +5460,471 @@ impl Workspace {
         )
     }
 
-    fn settings_overlay(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        self.settings_open.then(|| {
-            div()
-                .id("appearance-settings")
-                .absolute()
-                .occlude()
-                .left_0()
-                .top(px(64.0))
-                .bottom_0()
-                .w(px(SIDEBAR_WIDTH))
-                .min_h_0()
-                .overflow_y_scroll()
-                .p_4()
-                .flex()
-                .flex_col()
-                .gap_4()
-                .bg(rgb(0x181825))
-                .child(
+    fn settings_option(
+        id: impl Into<gpui::ElementId>,
+        label: &'static str,
+        selected: bool,
+    ) -> Stateful<Div> {
+        div()
+            .id(id)
+            .h(px(34.0))
+            .flex_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(if selected { 0xcba6f7 } else { 0x45475a }))
+            .bg(rgb(if selected { 0x313244 } else { 0x181825 }))
+            .text_sm()
+            .text_color(rgb(0xcdd6f4))
+            .cursor_pointer()
+            .hover(|button| button.bg(rgb(0x313244)))
+            .child(label)
+    }
+
+    fn settings_shell(&self, id: &'static str, cx: &mut Context<Self>) -> Stateful<Div> {
+        div()
+            .id(id)
+            .absolute()
+            .occlude()
+            .left_0()
+            .top(px(64.0))
+            .bottom_0()
+            .w(px(SIDEBAR_WIDTH))
+            .min_h_0()
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .bg(rgb(0x181825))
+            .text_sm()
+            .text_color(rgb(0xcdd6f4))
+            .child(
+                div()
+                    .h(px(44.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child("Settings"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x7f849c))
+                                    .child("Changes save automatically"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("close-settings-panel")
+                            .size(px(28.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(0x45475a))
+                            .text_color(rgb(0xa6adc8))
+                            .cursor_pointer()
+                            .hover(|button| button.bg(rgb(0x313244)))
+                            .child("×")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_settings(cx);
+                            })),
+                    ),
+            )
+            .child(self.settings_status(cx))
+    }
+
+    fn settings_category(label: &'static str) -> Div {
+        div()
+            .mt_2()
+            .pt_3()
+            .border_t_1()
+            .border_color(rgb(0x313244))
+            .text_sm()
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .child(label)
+    }
+
+    fn settings_status(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .when(self.boomux_settings_busy, |panel| {
+                panel.child(div().text_xs().child("Saving or loading settings…"))
+            })
+            .when_some(self.boomux_settings_message.clone(), |panel, message| {
+                panel.child(div().text_xs().text_color(rgb(0xf9e2af)).child(message))
+            })
+            .when(self.settings_restart_pending, |panel| {
+                panel.child(
+                    Self::settings_option("settings-restart", "↻ Restart to apply changes", true)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if !this.boomux_settings_busy {
+                                this.settings_restart_confirm = true;
+                                cx.notify();
+                            }
+                        })),
+                )
+            })
+            .when(self.boomux_settings_message.is_some(), |panel| {
+                panel.child(
                     div()
-                        .h(px(44.0))
-                        .flex_none()
                         .flex()
-                        .items_center()
-                        .justify_between()
+                        .gap_2()
                         .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .child(
-                                    div()
-                                        .text_base()
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .child("Settings"),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(0x6c7086))
-                                        .child("Changes apply immediately"),
-                                ),
+                            Self::settings_option("retry-settings", "Retry save", false).on_click(
+                                cx.listener(|this, _, _, cx| this.save_boomux_settings(cx)),
+                            ),
                         )
                         .child(
-                            div()
-                                .id("close-settings")
-                                .size(px(28.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(rgb(0x45475a))
-                                .text_color(rgb(0xa6adc8))
-                                .cursor_pointer()
-                                .hover(|button| button.bg(rgb(0x313244)))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.settings_open = false;
-                                    cx.notify();
-                                }))
-                                .child("×"),
+                            Self::settings_option("reload-settings", "Reload", false).on_click(
+                                cx.listener(|this, _, _, cx| this.load_boomux_settings(cx)),
+                            ),
                         ),
                 )
+            })
+    }
+
+    fn restart_settings_service(&mut self, cx: &mut Context<Self>) {
+        if self.boomux_settings_busy || !self.settings_restart_confirm {
+            return;
+        }
+        self.settings_restart_confirm = false;
+        self.boomux_settings_busy = true;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async { boomux_settings::restart() })
+                .await;
+            this.update(cx, |this, cx| {
+                this.boomux_settings_busy = false;
+                match result {
+                    Ok(()) => {
+                        this.settings_restart_pending = false;
+                        this.boomux_settings_message = None;
+                        this.save_settings();
+                    }
+                    Err(error) => this.boomux_settings_message = Some(error),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn settings_restart_overlay(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        self.settings_restart_confirm.then(|| {
+            div().absolute().inset_0().occlude().flex().items_center().justify_center()
+                .bg(rgba(0x00000099))
+                .child(div().w(px(400.0)).p_4().rounded_md().border_1().border_color(rgb(0x45475a))
+                    .bg(rgb(0x181825)).flex().flex_col().gap_4().text_color(rgb(0xcdd6f4))
+                    .child(div().text_base().child("Restart to apply settings?"))
+                    .child(div().text_sm().child("The terminal service will restart. Running shells and commands stay alive; terminal views reconnect briefly."))
+                    .child(div().flex().gap_2()
+                        .child(Self::settings_option("cancel-settings-restart", "Later", false)
+                            .on_click(cx.listener(|this, _, _, cx| { this.settings_restart_confirm = false; cx.notify(); })))
+                        .child(Self::settings_option("confirm-settings-restart", "Restart now", true)
+                            .on_click(cx.listener(|this, _, _, cx| this.restart_settings_service(cx))))))
+                .into_any_element()
+        })
+    }
+
+    fn load_boomux_settings(&mut self, cx: &mut Context<Self>) {
+        if self.boomux_settings_busy {
+            return;
+        }
+        self.boomux_setting_input = None;
+        self.boomux_settings_busy = true;
+        self.boomux_settings_message = None;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async { boomux_settings::load() })
+                .await;
+            this.update(cx, |this, cx| {
+                this.boomux_settings_busy = false;
+                match result {
+                    Ok(snapshot) => {
+                        this.boomux_settings_snapshot = Some(snapshot);
+                        this.boomux_settings_message = None;
+                    }
+                    Err(error) => {
+                        this.boomux_settings_snapshot = None;
+                        this.boomux_settings_message = Some(error);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn save_boomux_settings(&mut self, cx: &mut Context<Self>) {
+        if self.boomux_settings_busy || self.boomux_setting_input.is_some() {
+            return;
+        }
+        let Some(snapshot) = self.boomux_settings_snapshot.clone() else {
+            return;
+        };
+        if !snapshot.dirty() {
+            self.boomux_settings_message = Some("No changes to save.".into());
+            cx.notify();
+            return;
+        }
+        self.boomux_settings_busy = true;
+        self.boomux_settings_message = None;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let requires_restart = snapshot.restart_changed();
+                    boomux_settings::save(&snapshot).map(|saved| (saved, requires_restart))
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.boomux_settings_busy = false;
+                match result {
+                    Ok((snapshot, requires_restart)) => {
+                        this.boomux_settings_snapshot = Some(snapshot);
+                        this.boomux_settings_message = None;
+                        this.settings_restart_pending |= requires_restart;
+                        // Finishing a save must not interrupt someone still choosing settings.
+                        this.settings_restart_confirm |= requires_restart && !this.settings_open;
+                        this.save_settings();
+                    }
+                    Err(error) => this.boomux_settings_message = Some(error),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn accept_boomux_setting(&mut self, cx: &mut Context<Self>) {
+        if let Some((index, text)) = self.boomux_setting_input.clone()
+            && let Some(snapshot) = &mut self.boomux_settings_snapshot
+        {
+            match snapshot.set(index, Some(&text)) {
+                Ok(()) => {
+                    self.boomux_setting_input = None;
+                    self.boomux_settings_message = None;
+                    self.save_boomux_settings(cx);
+                }
+                Err(error) => self.boomux_settings_message = Some(error),
+            }
+        }
+        cx.notify();
+    }
+
+    fn boomux_setting_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        match event.keystroke.key.as_str() {
+            "escape" => self.boomux_setting_input = None,
+            "enter" if !event.keystroke.modifiers.shift => self.accept_boomux_setting(cx),
+            key => {
+                if let Some((index, value)) = &mut self.boomux_setting_input {
+                    if key == "backspace" {
+                        value.pop();
+                    } else if key == "a" && event.keystroke.modifiers.control {
+                        value.clear();
+                    } else if key == "enter"
+                        && matches!(
+                            boomux_settings::FIELDS[*index].kind,
+                            boomux_settings::Kind::Roots
+                        )
+                    {
+                        append_boomux_setting_text(value, "\n");
+                    } else if !event.keystroke.modifiers.control
+                        && !event.keystroke.modifiers.platform
+                        && !event.keystroke.modifiers.alt
+                        && let Some(text) = event.keystroke.key_char.as_deref()
+                    {
+                        append_boomux_setting_text(value, text);
+                    }
+                }
+            }
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn shared_settings_rows(
+        &self,
+        indices: &[usize],
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let mut rows = Vec::new();
+        if let Some(snapshot) = &self.boomux_settings_snapshot {
+            for &index in indices {
+                let field = &boomux_settings::FIELDS[index];
+                let enabled = snapshot.control_enabled(index);
+                let mut row = div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .when(!enabled, |row| row.opacity(0.4))
+                    .child(div().text_xs().text_color(rgb(0x7f849c)).child(field.label));
+                if self
+                    .boomux_setting_input
+                    .as_ref()
+                    .is_some_and(|(field, _)| *field == index)
+                {
+                    let text = self.boomux_setting_input.as_ref().unwrap().1.clone();
+                    row = row
+                        .child(
+                            div()
+                                .p_2()
+                                .min_h(px(32.0))
+                                .max_h(px(140.0))
+                                .overflow_hidden()
+                                .bg(rgb(0x313244))
+                                .text_xs()
+                                .child(if text.is_empty() {
+                                    "Type a value…".into()
+                                } else {
+                                    text
+                                }),
+                        )
+                        .child(div().text_xs().text_color(rgb(0x7f849c)).child(
+                            if matches!(field.kind, boomux_settings::Kind::Roots) {
+                                "Enter: accept · Esc: cancel · Ctrl+A: clear · Shift+Enter: new folder."
+                            } else {
+                                "Enter: accept · Esc: cancel · Ctrl+A: clear."
+                            },
+                        ))
+                        .child(
+                            Self::settings_option(("accept-boomux-field", index), "Done", true)
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.accept_boomux_setting(cx)),
+                                ),
+                        );
+                } else {
+                    let options: Vec<(&str, Option<&str>)> = match field.kind {
+                        boomux_settings::Kind::Bool => {
+                            vec![("On", Some("true")), ("Off", Some("false"))]
+                        }
+                        boomux_settings::Kind::Choice(values) => values
+                            .iter()
+                            .map(|value| {
+                                (
+                                    match *value {
+                                        "disabled" => "Off",
+                                        "hyprland-special" => "Special workspace",
+                                        other => other,
+                                    },
+                                    Some(*value),
+                                )
+                            })
+                            .collect(),
+                        _ => vec![("Edit", Some("edit"))],
+                    };
+                    if !matches!(
+                        field.kind,
+                        boomux_settings::Kind::Bool | boomux_settings::Kind::Choice(_)
+                    ) {
+                        let preview = snapshot
+                            .value(field.key)
+                            .map(|value| {
+                                if let Some(values) = value.as_array() {
+                                    match values.len() {
+                                        0 => "No folders selected".into(),
+                                        1 => values
+                                            .get(0)
+                                            .and_then(|value| value.as_str())
+                                            .unwrap_or("")
+                                            .chars()
+                                            .take(80)
+                                            .collect(),
+                                        count => format!("{count} folders"),
+                                    }
+                                } else if let Some(text) = value.as_str() {
+                                    if text.is_empty() {
+                                        "System terminal".into()
+                                    } else {
+                                        text.chars().take(80).collect()
+                                    }
+                                } else {
+                                    value.to_string()
+                                }
+                            })
+                            .unwrap_or_else(|| "Not set".into());
+                        row = row.child(div().text_xs().text_color(rgb(0xa6adc8)).child(preview));
+                    }
+                    let mut buttons = div().flex().gap_2();
+                    for (option_index, (label, value)) in options.into_iter().enumerate() {
+                        let selected = match value {
+                            None => snapshot.value(field.key).is_none(),
+                            Some("edit") => false,
+                            Some(value) => snapshot.control_text(index) == value,
+                        };
+                        buttons = buttons.child(
+                            Self::settings_option(
+                                (SharedString::from(format!("boomux-field-{index}")), option_index),
+                                label, selected,
+                            )
+                                .when(!enabled, |button| button.cursor_default().hover(|button| button))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    if this.boomux_settings_busy || !enabled {
+                                        return;
+                                    }
+                                    this.boomux_settings_message = None;
+                                    if let Some(snapshot) = &mut this.boomux_settings_snapshot {
+                                        if value == Some("edit") {
+                                            let text = snapshot.text(index);
+                                            if text.len() > 16384 {
+                                                this.boomux_settings_message = Some("This value is too large for the Desktop editor. Use boomux config edit.".into());
+                                            } else {
+                                                this.boomux_setting_input = Some((index, text));
+                                                window.focus(&this.focus_handle, cx);
+                                            }
+                                        } else if value.is_some_and(|value| snapshot.control_text(index) != value) {
+                                            if let Err(error) = snapshot.set_control(index, value.unwrap()) {
+                                                this.boomux_settings_message = Some(error);
+                                            } else {
+                                                if this.boomux_setting_input.as_ref().is_some_and(|(field, _)| !snapshot.control_enabled(*field)) {
+                                                    this.boomux_setting_input = None;
+                                                }
+                                                this.save_boomux_settings(cx);
+                                            }
+                                        }
+                                    }
+                                    cx.notify();
+                                })),
+                        );
+                    }
+                    row = row.child(buttons);
+                }
+                rows.push(row.into_any_element());
+            }
+        }
+        rows
+    }
+
+    fn settings_overlay(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        self.settings_open.then(|| {
+            let content = div().flex_none().flex().flex_col().gap_4()
+                .child(Self::settings_category("Layout & workspaces"))
+                .when_some(self.settings_error.clone(), |panel, error| panel.child(
+                    div().text_xs().text_color(rgb(0xf38ba8)).child(format!("Settings could not be saved or loaded: {error}. Check settings.toml and restart."))
+                ))
                 .child(
                     div()
                         .flex()
@@ -5582,6 +6078,7 @@ impl Workspace {
                                             } else {
                                                 cx.notify();
                                             }
+                                            this.save_settings();
                                         }))
                                         .child("Workspace"),
                                 )
@@ -5631,6 +6128,7 @@ impl Workspace {
                                                 WorkspacePaneMode::Mixed,
                                             ) {
                                                 this.workspace_pane_mode = WorkspacePaneMode::Mixed;
+                                                this.save_settings();
                                                 cx.notify();
                                             }
                                         }))
@@ -5647,6 +6145,7 @@ impl Workspace {
                             },
                         )),
                 )
+                .child(Self::settings_category("Appearance"))
                 .child(
                     div()
                         .flex()
@@ -5685,7 +6184,8 @@ impl Workspace {
                                         .cursor_pointer()
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.pane_headings_visible = true;
-                                            cx.notify();
+                                            this.save_settings();
+                                    cx.notify();
                                         }))
                                         .child("On"),
                                 )
@@ -5712,7 +6212,8 @@ impl Workspace {
                                         .cursor_pointer()
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.pane_headings_visible = false;
-                                            cx.notify();
+                                            this.save_settings();
+                                    cx.notify();
                                         }))
                                         .child("Off"),
                                 ),
@@ -5760,7 +6261,8 @@ impl Workspace {
                                         .cursor_pointer()
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.pane_corner_style = PaneCornerStyle::Rounded;
-                                            cx.notify();
+                                            this.save_settings();
+                                    cx.notify();
                                         }))
                                         .child("Rounded"),
                                 )
@@ -5791,7 +6293,8 @@ impl Workspace {
                                         .cursor_pointer()
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.pane_corner_style = PaneCornerStyle::Square;
-                                            cx.notify();
+                                            this.save_settings();
+                                    cx.notify();
                                         }))
                                         .child("Square"),
                                 )
@@ -5822,7 +6325,8 @@ impl Workspace {
                                         .cursor_pointer()
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.pane_corner_style = PaneCornerStyle::Mixed;
-                                            cx.notify();
+                                            this.save_settings();
+                                    cx.notify();
                                         }))
                                         .child("Mixed"),
                                 ),
@@ -5858,7 +6362,8 @@ impl Workspace {
                                         .hover(|button| button.bg(rgb(0x313244)))
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.pane_gap = (this.pane_gap - 2.0).max(0.0);
-                                            cx.notify();
+                                            this.save_settings();
+                                    cx.notify();
                                         }))
                                         .child("−"),
                                 )
@@ -5892,7 +6397,8 @@ impl Workspace {
                                         .hover(|button| button.bg(rgb(0x313244)))
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.pane_gap = (this.pane_gap + 2.0).min(32.0);
-                                            cx.notify();
+                                            this.save_settings();
+                                    cx.notify();
                                         }))
                                         .child("+"),
                                 ),
@@ -5940,7 +6446,8 @@ impl Workspace {
                                             this.motion_speed = MotionSpeed::Instant;
                                             this.layout_animation = None;
                                             this.floating_animation = None;
-                                            cx.notify();
+                                            this.save_settings();
+                                    cx.notify();
                                         }))
                                         .child("Instant"),
                                 )
@@ -5969,7 +6476,8 @@ impl Workspace {
                                         .cursor_pointer()
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.motion_speed = MotionSpeed::Fast;
-                                            cx.notify();
+                                            this.save_settings();
+                                    cx.notify();
                                         }))
                                         .child("Fast"),
                                 )
@@ -5998,7 +6506,8 @@ impl Workspace {
                                         .cursor_pointer()
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.motion_speed = MotionSpeed::Smooth;
-                                            cx.notify();
+                                            this.save_settings();
+                                    cx.notify();
                                         }))
                                         .child("Smooth"),
                                 ),
@@ -6035,7 +6544,8 @@ impl Workspace {
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.focus_highlight_strength =
                                                 this.focus_highlight_strength.saturating_sub(10);
-                                            cx.notify();
+                                            this.save_settings();
+                                    cx.notify();
                                         }))
                                         .child("−"),
                                 )
@@ -6072,12 +6582,18 @@ impl Workspace {
                                                 .focus_highlight_strength
                                                 .saturating_add(10)
                                                 .min(100);
-                                            cx.notify();
+                                            this.save_settings();
+                                    cx.notify();
                                         }))
                                         .child("+"),
                                 ),
                         ),
                 )
+                .child(Self::settings_category("Notifications & sounds"))
+                .children(self.shared_settings_rows(&[0, 1, 2, 3, 4, 5], cx))
+                .child(Self::settings_category("Recovery & history"))
+                .children(self.shared_settings_rows(&[6, 7], cx))
+                .child(Self::settings_category("Safety"))
                 .child(
                     div()
                         .flex()
@@ -6116,7 +6632,8 @@ impl Workspace {
                                         .cursor_pointer()
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.confirm_destructive_actions = true;
-                                            cx.notify();
+                                            this.save_settings();
+                                    cx.notify();
                                         }))
                                         .child("On"),
                                 )
@@ -6143,13 +6660,17 @@ impl Workspace {
                                         .cursor_pointer()
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.confirm_destructive_actions = false;
-                                            cx.notify();
+                                            this.save_settings();
+                                    cx.notify();
                                         }))
                                         .child("Off"),
                                 ),
                         ),
                 )
-                .into_any_element()
+                ;
+            let body = div().id("settings-list").flex_1().min_h_0().overflow_y_scroll()
+                .child(content.child(div().h(px(16.0)).flex_none()));
+            self.settings_shell("settings", cx).child(body).into_any_element()
         })
     }
 
@@ -7499,16 +8020,19 @@ impl Render for Workspace {
             .into_any_element();
         let sidebar_menu = self.sidebar_menu_overlay(cx);
         let resource_dialog = self.resource_dialog_overlay(cx);
+        let settings_restart = self.settings_restart_overlay(cx);
         let help = self.help_overlay(cx);
 
         div()
             .id("workspace")
             .track_focus(&self.focus_handle)
-            .key_context(workspace_key_context(
-                self.help_open,
-                self.navigation_region,
-                self.layout_mode,
-            ))
+            .key_context(
+                if self.boomux_setting_input.is_some() || self.settings_restart_confirm {
+                    "BoomuxSettingsInput"
+                } else {
+                    workspace_key_context(self.help_open, self.navigation_region, self.layout_mode)
+                },
+            )
             .on_action(cx.listener(Self::focus_left))
             .on_action(cx.listener(Self::focus_right))
             .on_action(cx.listener(Self::focus_up))
@@ -7581,6 +8105,7 @@ impl Render for Workspace {
             .child(content)
             .when_some(sidebar_menu, |element, menu| element.child(menu))
             .when_some(resource_dialog, |element, dialog| element.child(dialog))
+            .when_some(settings_restart, |element, dialog| element.child(dialog))
             .when_some(help, |element, help| element.child(help))
     }
 }
@@ -7674,6 +8199,15 @@ fn desktop_keystroke(keystroke: &gpui::Keystroke, layout_mode: bool) -> bool {
                     keystroke.key.as_str(),
                     "h" | "j" | "k" | "l" | "left" | "right" | "up" | "down"
                 )))
+}
+
+fn append_boomux_setting_text(value: &mut String, text: &str) {
+    for character in text.chars().filter(|c| !c.is_control() || *c == '\n') {
+        if value.len() + character.len_utf8() > 16384 {
+            break;
+        }
+        value.push(character);
+    }
 }
 
 fn append_resource_name(value: &mut String, text: &str) {
@@ -7909,8 +8443,36 @@ fn paint_terminal_images(
 }
 
 fn main() {
-    gpui_platform::application().run(|cx: &mut App| {
+    let args = std::env::args_os().collect::<Vec<_>>();
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == boomux_settings::EDITOR_FLAG)
+    {
+        let result = if args.len() == 4 {
+            boomux_settings::editor(
+                std::path::Path::new(&args[2]),
+                std::path::Path::new(&args[3]),
+            )
+        } else {
+            Err("Expected request directory and editor working file".into())
+        };
+        if let Err(error) = result {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    let loaded = settings::path()
+        .ok_or_else(|| "Cannot resolve the Desktop settings directory".to_string())
+        .and_then(|path| settings::Settings::load(&path));
+    let (saved, settings_error) = match loaded {
+        Ok(saved) => (saved, None),
+        Err(error) => (settings::Settings::default(), Some(error)),
+    };
+    gpui_platform::application().run(move |cx: &mut App| {
         cx.bind_keys([
+            KeyBinding::new("ctrl-shift-v", PasteClipboard, Some("BoomuxSettingsInput")),
+            KeyBinding::new("shift-insert", PasteClipboard, Some("BoomuxSettingsInput")),
             KeyBinding::new("h", FocusLeft, Some("Layout")),
             KeyBinding::new("l", FocusRight, Some("Layout")),
             KeyBinding::new("k", FocusUp, Some("Layout")),
@@ -8025,7 +8587,7 @@ fn main() {
                 app_id: Some("org.omarchy.boomux-desktop".into()),
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| Workspace::new(window, cx)),
+            move |window, cx| cx.new(|cx| Workspace::new(window, cx, saved, settings_error)),
         )
         .unwrap();
         cx.activate(true);

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import shlex
 import subprocess
 import tarfile
 import tempfile
@@ -57,6 +58,41 @@ def stop(process):
             process.wait(timeout=5)
 
 
+def check_config_editor(bundle, env, root):
+    """Exercise Desktop's editor bridge through Boomux's real transaction."""
+    request = root / "config-editor-request"
+    request.mkdir(mode=0o700)
+    target = root / "config-editor.toml"
+    child_env = dict(env, BOOMUX_CONFIG=str(target))
+    child_env["VISUAL"] = shlex.join([
+        str(bundle / "libexec/boomux-desktop"), "--boomux-settings-editor", str(request)])
+    (request / "target").write_text(str(target))
+
+    def edit(baseline, candidate, expected_success):
+        baseline_path = request / "baseline"
+        if baseline is None:
+            baseline_path.unlink(missing_ok=True)
+        else:
+            baseline_path.write_text(baseline)
+        (request / "candidate").write_text(candidate)
+        result = subprocess.run([bundle / "bin/boomux", "config", "edit"], env=child_env,
+                                capture_output=True, text=True, timeout=15)
+        if (result.returncode == 0) != expected_success:
+            raise RuntimeError(f"config editor transaction: {result.stderr}")
+
+    initial = "# user preferences\n[notifications]\nenabled = false # retain comment\n"
+    edit(None, initial, True)
+    changed = initial.replace("false", "true")
+    edit(initial, changed, True)
+    if target.read_text() != changed:
+        raise RuntimeError("config editor did not commit exact candidate")
+    edit(initial, initial, False)  # stale UI snapshot
+    edit(changed, "[projects]\nmax_depth = 99\n", False)  # owner validation
+    if target.read_text() != changed:
+        raise RuntimeError("rejected edit changed the Boomux configuration")
+    print("PASS: Boomux settings save, conflict detection, and validation", flush=True)
+
+
 def smoke(backend, archive, output, software_driver=None):
     output.mkdir(parents=True, exist_ok=True)
     expected = Path(str(archive) + ".sha256").read_text().split()[0]
@@ -88,6 +124,7 @@ def smoke(backend, archive, output, software_driver=None):
             raise RuntimeError("Mesa lavapipe is required (install mesa-vulkan-drivers)")
         env["VK_DRIVER_FILES"] = str(drivers[0])
         env["VK_ICD_FILENAMES"] = str(drivers[0])
+        check_config_editor(bundle, env, root)
         processes, apps, logs = [], [], []
         shell_id = None
 

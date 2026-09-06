@@ -31,9 +31,12 @@ Defaults:
     bin/boomux
     bin/boomux-desktop          # launcher
     libexec/boomux-desktop      # graphical executable
+    share/applications/org.omarchy.boomux-desktop.desktop
+    share/icons/hicolor/scalable/apps/org.omarchy.boomux-desktop.svg
     LICENSE
     LICENSE.boomux
     release.txt
+  desktop-entry               # generated entry with the absolute launcher path
   current -> releases/<tag>-<archive-sha256>
 ~/.local/bin/boomux-desktop -> <install-root>/current/bin/boomux-desktop
 ~/.local/bin/boomux -> <install-root>/current/bin/boomux
@@ -185,3 +188,103 @@ comparisons or comprehensive keyboard/mouse tests. They do not prove real GPU
 behavior or all distributions. macOS and Windows checks will be added with
 their corresponding build targets. Record platform and backend when reporting
 additional testing.
+
+## Desktop Integration And Preferences
+
+The bundle includes a temporary four-tile SVG icon and an application entry.
+The installer registers `org.omarchy.boomux-desktop.desktop` in
+`${XDG_DATA_HOME:-$HOME/.local/share}/applications` and links the icon into the
+matching `icons/hicolor/scalable/apps` directory. It preserves unrelated menu
+entries and icons by refusing to replace them. The installed entry uses the
+absolute bundled launcher path, including proper quoting for paths with spaces;
+launching from the menu does not depend on the session's PATH.
+
+Desktop preferences are stored in
+`${XDG_CONFIG_HOME:-$HOME/.config}/boomux-desktop/settings.toml`. The app loads
+this file on startup and saves changes made through Settings automatically.
+It persists sidebar visibility, pane headings, corner style, spacing, focus
+highlight strength, motion speed, pane scope, tiled/tabbed presentation, and
+removal confirmation. Window geometry, pane arrangements, minimized Shells, and
+Workspace ordering are not yet restored across restarts. Boomux still owns
+Shell persistence and resource identities.
+
+Example preferences (omitted keys use defaults):
+
+```toml
+pane_gap = 8
+motion_speed = "smooth" # instant, fast, smooth
+pane_corner_style = "rounded" # rounded, square, mixed
+pane_headings_visible = true
+confirm_destructive_actions = true
+```
+
+Writes use a capacity-one background queue and atomic file replacement. Normal
+application shutdown waits asynchronously for the final queued write, within
+GPUI's shutdown deadline. Forced termination can still interrupt a pending save.
+With several Desktop instances, the last completed save wins. Manual file edits
+are read on the next launch. Invalid or oversized files are left intact: the app
+uses defaults, disables saving for that session, and reports the problem in
+Settings. Correct the file (or move it aside) and restart to resume saving.
+
+Settings is one list grouped into Layout & workspaces, Appearance, Notifications &
+sounds, Recovery & history, and Safety.
+Changes save automatically. Text fields use Done or Enter to save, Escape to cancel,
+and Ctrl+A to clear. Clipboard paste is supported.
+
+Shared preferences are saved through Boomux's supported `config edit` transaction.
+Controls show configured values from the active file, global configuration, and
+pinned defaults; only edited fields are written. `BOOMUX_CONFIG` selects the active
+override file when set. Boomux validates the candidate, checks ownership and
+conflicts, and atomically commits it. Comments and unrelated fields are preserved.
+
+Notifications is a master switch for desktop popups and sounds. Turning it off
+disables both channels and dims dependent controls while preserving event choices
+and sound names. Turning it back on enables popups; sounds can then be enabled
+separately. Sound-name controls are unavailable while sounds are off.
+
+Notification and recovery changes set one restart reminder
+in the settings header. Individual settings have no restart labels and saving
+does not interrupt editing. Closing settings offers **Restart now** or **Later**;
+the header button also opens confirmation when ready. The reminder survives
+Desktop restarts. Restart invokes the
+local `boomux daemon restart` graceful handoff on a worker thread, preserving
+running shells and commands. A failed restart retains the reminder and reports
+the error. An external restart may leave a conservative reminder until a confirmed
+restart from Settings. Other preferences do not request a daemon restart.
+Remote Node configuration remains managed on those Nodes.
+
+## Uninstall
+
+Close Desktop first. Remove only the links owned by this installer:
+
+```sh
+release_data_dir=${XDG_DATA_HOME:-$HOME/.local/share}
+release_install_dir=${BOOMUX_DESKTOP_INSTALL_DIR:-$release_data_dir/boomux-desktop}
+release_bin_dir=${BOOMUX_DESKTOP_BIN_DIR:-$HOME/.local/bin}
+release_install_dir=$(cd "$release_install_dir" && pwd -P) || exit 1
+release_app_id=org.omarchy.boomux-desktop
+
+remove_owned_link() {
+    if [ "$(readlink "$1" 2>/dev/null)" = "$2" ]; then
+        rm -- "$1"
+    fi
+}
+remove_owned_link "$release_bin_dir/boomux-desktop" "$release_install_dir/current/bin/boomux-desktop"
+remove_owned_link "$release_bin_dir/boomux" "$release_install_dir/current/bin/boomux"
+remove_owned_link "$release_data_dir/applications/$release_app_id.desktop" "$release_install_dir/desktop-entry"
+remove_owned_link "$release_data_dir/icons/hicolor/scalable/apps/$release_app_id.svg" "$release_install_dir/current/share/icons/hicolor/scalable/apps/$release_app_id.svg"
+```
+
+Use the same custom directory overrides used during installation. Existing
+standalone Boomux executables are preserved. These steps do not stop a daemon,
+close Shells, or delete Boomux configuration/history.
+
+The release directory may also supply a running Boomux daemon. Keep it until no
+Desktop or Boomux process uses its executables. If you will keep using Boomux,
+install it separately and use Boomux's own lifecycle procedure to move off the
+bundled daemon before deleting the directory. Once it is unused, remove the
+bundle directory printed by `printf '%s\n' "$release_install_dir"`.
+
+Desktop preferences are retained for reinstalling. To reset them, remove only
+`${XDG_CONFIG_HOME:-$HOME/.config}/boomux-desktop/settings.toml`. Do not remove
+Boomux's configuration or data directories to uninstall Desktop.
