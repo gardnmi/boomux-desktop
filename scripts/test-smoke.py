@@ -39,6 +39,12 @@ class SmokeEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "process exited"):
             SMOKE["wait_for"]("window", lambda: True, [process])
 
+    def test_illegal_instruction_is_reported_by_signal_name(self):
+        process = Mock(returncode=-4)
+        process.poll.return_value = -4
+        with self.assertRaisesRegex(RuntimeError, "SIGILL"):
+            SMOKE["wait_for"]("window", lambda: True, [process])
+
     def test_wait_has_a_deadline(self):
         with self.assertRaisesRegex(RuntimeError, "timed out"):
             SMOKE["wait_for"]("window", lambda: False, [], seconds=0)

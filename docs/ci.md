@@ -25,15 +25,24 @@ commits (the PR merge ref, merge-group commit, and actual main commit).
 
 Main, merge-queue, and manual CI builds also package the pinned Boomux executable
 and pass the exact archive to `desktop-smoke.yml`. Separate Ubuntu 24.04 jobs run
-X11 on Xvfb and Wayland on Weston nested inside Xvfb. The nested backend supplies
+X11 on Xvfb with Desktop running under QEMU's Nehalem CPU (no AVX),
+and native Wayland on Weston nested inside Xvfb. The nested backend supplies
 the input seat GPUI requires; it still needs no physical display. Mesa lavapipe
 and llvmpipe provide software rendering. Ordinary PR runs omit these display
 jobs along with the optimized build.
 
+The vendored libghostty-vt-sys build forces Zig's baseline CPU target; its
+compiler-rt routines must not assume features of the build runner. See
+`vendor/libghostty-vt-sys/PATCH.md`. The CI cache key includes baseline-v1
+to invalidate earlier CPU-specific objects.
+
 The harness uses private XDG directories and a private D-Bus without service
 activation. It checks a mapped X11 window or a Wayland window buffer commit and
 frame callback, starts a pending Shell through Desktop, and verifies that the
-same ShellRun and daemon survive client exit and reopening. Commands and waits
+same ShellRun and daemon survive client exit and reopening. In CPU-emulated
+mode, the harness starts Boomux explicitly and sets the bundled PATH before
+launching the Desktop ELF through QEMU; native Wayland also exercises the shell
+launcher itself. Commands and waits
 have deadlines; cleanup closes only the fixture Shell and its isolated daemon.
 Logs and exact resource IDs are uploaded for 14 days, including on failures.
 

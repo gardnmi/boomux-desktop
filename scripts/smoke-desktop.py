@@ -19,7 +19,9 @@ def wait_for(description, predicate, processes, seconds=30):
     while time.monotonic() < deadline:
         for process in processes:
             if process.poll() is not None:
-                raise RuntimeError(f"{description}: process exited with {process.returncode}")
+                code = process.returncode
+                detail = signal.Signals(-code).name if code < 0 else str(code)
+                raise RuntimeError(f"{description}: process exited with {detail}")
         if predicate():
             return
         time.sleep(0.2)
@@ -93,7 +95,7 @@ def check_config_editor(bundle, env, root):
     print("PASS: Boomux settings save, conflict detection, and validation", flush=True)
 
 
-def smoke(backend, archive, output, software_driver=None):
+def smoke(backend, archive, output, software_driver=None, cpu_model=None):
     output.mkdir(parents=True, exist_ok=True)
     expected = Path(str(archive) + ".sha256").read_text().split()[0]
     with archive.open("rb") as source:
@@ -190,7 +192,14 @@ def smoke(backend, archive, output, software_driver=None):
                 child_env = dict(env)
                 if backend == "wayland":
                     child_env["WAYLAND_DEBUG"] = "client"
-                app = start([bundle / "bin/boomux-desktop"], name, child_env)
+                command = [bundle / "bin/boomux-desktop"]
+                if cpu_model:
+                    # QEMU executes ELF binaries, so reproduce the bundled launcher's
+                    # environment and daemon-start step before emulating Desktop.
+                    cli("daemon", "start")
+                    child_env["PATH"] = str(bundle / "bin") + os.pathsep + child_env.get("PATH", "")
+                    command = ["qemu-x86_64", "-cpu", cpu_model, str(bundle / "libexec/boomux-desktop")]
+                app = start(command, name, child_env)
                 apps.append(app)
                 log_path = output / f"{name}.log"
 
@@ -210,7 +219,7 @@ def smoke(backend, archive, output, software_driver=None):
                 wait_for(f"{backend} window/frame", visible, [*servers, app])
                 return app
 
-            # The bundled launcher must start a daemon on a clean runtime.
+            # Exercise startup on a clean runtime, including the launcher on native runs.
             app = launch("empty-start")
             status = json.loads(cli("--json", "daemon", "status"))["data"]
             if status["status"] != "running":
@@ -249,7 +258,7 @@ def smoke(backend, archive, output, software_driver=None):
             if json.loads(cli("--json", "daemon", "status"))["data"]["pid"] != daemon_pid:
                 raise RuntimeError("reopening Desktop replaced the daemon")
             (output / "result.json").write_text(json.dumps(
-                dict(backend=backend, shell_id=shell_id, run_id=run_id, status="passed",
+                dict(backend=backend, cpu_model=cpu_model, shell_id=shell_id, run_id=run_id, status="passed",
                      archive_sha256=actual, boomux_version=cli("--version").strip()), indent=2))
             print(f"PASS: {backend} bundle startup, attachment, and ShellRun survival", flush=True)
         finally:
@@ -274,10 +283,12 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--software-driver", type=Path,
                         help="lavapipe ICD JSON for a non-system Mesa installation")
+    parser.add_argument("--cpu-model", choices=["", "Nehalem"], default="",
+                        help="emulate Desktop on an older x86 CPU without AVX")
     args = parser.parse_args()
 
     def interrupted(signum, _frame):
         raise RuntimeError(f"smoke test interrupted by signal {signum}")
 
     signal.signal(signal.SIGTERM, interrupted)
-    smoke(args.backend, args.archive.resolve(), args.output.resolve(), args.software_driver)
+    smoke(args.backend, args.archive.resolve(), args.output.resolve(), args.software_driver, args.cpu_model)
