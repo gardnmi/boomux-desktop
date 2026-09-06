@@ -33,16 +33,17 @@ jobs:
       - name: Install display and runtime dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes python3 dbus xvfb x11-utils weston \
+          sudo apt-get install --yes python3 dbus xvfb x11-utils weston qemu-user \
             mesa-vulkan-drivers libvulkan1 libegl1 libgl1-mesa-dri fonts-dejavu-core \
             libfontconfig1 libwayland-client0 libx11-6 libxcb-shape0 libxcb-xfixes0 \
             libxkbcommon0 libxkbcommon-x11-0
       - name: Exercise bundled Desktop and Boomux
         env:
           BACKEND: ${{ matrix.backend }}
+          CPU_MODEL: ${{ matrix.backend == 'x11' && 'Nehalem' || '' }}
         run: |
           timeout --kill-after=15s 150s \
-            python3 scripts/smoke-desktop.py --backend "$BACKEND" \
+            python3 scripts/smoke-desktop.py --backend "$BACKEND" --cpu-model "$CPU_MODEL" \
               --archive dist/boomux-desktop-x86_64-unknown-linux-gnu.tar.gz \
               --output "smoke-results/$BACKEND"
       - name: Upload diagnostic logs
