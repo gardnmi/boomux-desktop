@@ -160,3 +160,22 @@ owner-side validation failures against the pinned Boomux executable.
 
 The direct `toml_edit` dependency pins the version already present through
 Boomux, enabling preservation of user comments without adding another version.
+
+## Update Notices
+
+A window-owned task schedules read-only release checks ten seconds after startup
+and every six hours. A single in-flight worker checks the fixed Desktop GitHub
+latest-release endpoint and the installed Boomux CLI's public
+`--json update status` command. No daemon is started for discovery. Each process
+has a 20-second deadline and at most 128 KiB of retained output; curl also has a
+15-second request limit. Closing the window cancels its scheduler; any in-flight
+worker finishes within those bounds and cannot retain the window.
+
+Stable semantic versions are compared against the running Desktop build and the
+CLI-reported Boomux version. Two version strings in Desktop preferences remember
+dismissals independently. Only a different newer version or an explicit manual
+check restores a dismissed notice. Network errors do not create automatic alerts;
+manual checks report unavailable results. Release URLs are constructed from fixed
+repository names and validated versions. View release opens a browser; no updater
+or restart is invoked, and the bundled Boomux executable is never replaced
+independently of Desktop's pinned compatibility contract.

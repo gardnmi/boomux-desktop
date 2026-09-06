@@ -55,6 +55,12 @@ Restart preserves running shells and commands. Pane arrangements and window
 geometry are not yet saved.
 See [preferences and uninstalling](docs/releases.md#desktop-integration-and-preferences).
 
+Desktop checks for newer stable Desktop and Boomux releases shortly after startup
+and every six hours. Update cards offer **View release** and **Dismiss**. Dismissal
+is saved for that version; a newer release can notify you again. Use **Check for
+updates** in the header menu to revisit dismissed notices. Checks do not install
+software or restart anything. Bundled Boomux remains paired with its Desktop release.
+
 ## Run from source
 
 ```sh
