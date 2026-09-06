@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.2.0](https://github.com/gardnmi/boomux-desktop/compare/v0.1.0...v0.2.0) (2026-09-06)
+
+
+### Features
+
+* add native desktop client and bundled linux releases ([#7](https://github.com/gardnmi/boomux-desktop/issues/7)) ([3a530a3](https://github.com/gardnmi/boomux-desktop/commit/3a530a3eb93ea15ee930dd63174fec2ac421050e))
+* **updates:** add dismissible release notices ([#10](https://github.com/gardnmi/boomux-desktop/issues/10)) ([95946c1](https://github.com/gardnmi/boomux-desktop/commit/95946c14413eeac039e619c96368577463c59a53))
+
+
+### Bug Fixes
+
+* **build:** target portable CPUs in the Ghostty native library ([#9](https://github.com/gardnmi/boomux-desktop/issues/9)) ([0b4cb3c](https://github.com/gardnmi/boomux-desktop/commit/0b4cb3cf00c9445455b03ae16141c8ee87ea1201))
+* **sidebar:** distinguish agents sharing a shell ([#11](https://github.com/gardnmi/boomux-desktop/issues/11)) ([29b4e25](https://github.com/gardnmi/boomux-desktop/commit/29b4e250f1d20eaebaec2d12997ec2799d4e2b20))
+
+## Changelog
+
 All notable changes to Boomux Desktop will be documented in this file.
 
 ## Unreleased
