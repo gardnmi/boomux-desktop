@@ -7,6 +7,8 @@ use std::{
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
+    pub dismissed_desktop_update: String,
+    pub dismissed_boomux_update: String,
     pub settings_restart_pending: bool,
     pub sidebar_visible: bool,
     pub pane_headings_visible: bool,
@@ -21,6 +23,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            dismissed_desktop_update: String::new(),
+            dismissed_boomux_update: String::new(),
             settings_restart_pending: false,
             sidebar_visible: true,
             pane_headings_visible: true,
@@ -68,6 +72,17 @@ impl Settings {
         for (key, value) in values {
             let invalid = || format!("invalid Desktop setting: {key}");
             match key.as_str() {
+                "dismissed_desktop_update" | "dismissed_boomux_update" => {
+                    let text = value
+                        .as_str()
+                        .filter(|text| crate::updates::valid_dismissal(text))
+                        .ok_or_else(invalid)?;
+                    if key == "dismissed_desktop_update" {
+                        s.dismissed_desktop_update = text.into();
+                    } else {
+                        s.dismissed_boomux_update = text.into();
+                    }
+                }
                 "settings_restart_pending" => {
                     s.settings_restart_pending = value.as_bool().ok_or_else(invalid)?
                 }
@@ -135,7 +150,7 @@ impl Settings {
     }
     fn encode(&self) -> String {
         format!(
-            "# Boomux Desktop preferences; shared Boomux configuration is separate.\nsidebar_visible = {}\npane_headings_visible = {}\npane_corner_style = \"{}\"\npane_gap = {}\nfocus_highlight_strength = {}\nmotion_speed = \"{}\"\nworkspace_pane_mode = \"{}\"\npane_layout_mode = \"{}\"\nconfirm_destructive_actions = {}\nsettings_restart_pending = {}\n",
+            "# Boomux Desktop preferences; shared Boomux configuration is separate.\nsidebar_visible = {}\npane_headings_visible = {}\npane_corner_style = \"{}\"\npane_gap = {}\nfocus_highlight_strength = {}\nmotion_speed = \"{}\"\nworkspace_pane_mode = \"{}\"\npane_layout_mode = \"{}\"\nconfirm_destructive_actions = {}\nsettings_restart_pending = {}\ndismissed_desktop_update = \"{}\"\ndismissed_boomux_update = \"{}\"\n",
             self.sidebar_visible,
             self.pane_headings_visible,
             match self.pane_corner_style {
@@ -159,7 +174,9 @@ impl Settings {
                 PaneLayoutMode::Tabbed => "tabbed",
             },
             self.confirm_destructive_actions,
-            self.settings_restart_pending
+            self.settings_restart_pending,
+            self.dismissed_desktop_update,
+            self.dismissed_boomux_update
         )
     }
     fn save(&self, path: &Path) -> Result<(), String> {
@@ -210,6 +227,23 @@ pub fn writer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn update_dismissals_round_trip_independently() {
+        let settings = Settings {
+            dismissed_desktop_update: "0.2.0".into(),
+            dismissed_boomux_update: "1.10.0".into(),
+            ..Settings::default()
+        };
+        assert_eq!(Settings::parse(&settings.encode()).unwrap(), settings);
+        assert!(Settings::parse("dismissed_desktop_update = 'not a version'").is_err());
+        assert!(
+            Settings::parse("")
+                .unwrap()
+                .dismissed_desktop_update
+                .is_empty()
+        );
+    }
+
     #[test]
     fn restart_reminder_survives_reopening_desktop() {
         let settings = Settings {

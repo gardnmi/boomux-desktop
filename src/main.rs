@@ -5,6 +5,7 @@ mod layout_badge;
 mod settings;
 mod terminal;
 mod theme;
+mod updates;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -1296,6 +1297,12 @@ struct Workspace {
     theme_watcher: Option<ThemeWatcher>,
     theme_load_generation: u64,
     theme_error: Option<String>,
+    update_check: updates::Check,
+    updates_checking: bool,
+    updates_status: Option<String>,
+    update_task: Option<gpui::Task<()>>,
+    dismissed_desktop_update: String,
+    dismissed_boomux_update: String,
     settings_open: bool,
     settings_writer: Option<async_channel::Sender<settings::Settings>>,
     settings_error: Option<String>,
@@ -1455,6 +1462,12 @@ impl Workspace {
             theme_watcher: None,
             theme_load_generation: 0,
             theme_error: None,
+            update_check: updates::Check::default(),
+            updates_checking: false,
+            updates_status: None,
+            update_task: None,
+            dismissed_desktop_update: saved.dismissed_desktop_update,
+            dismissed_boomux_update: saved.dismissed_boomux_update,
             settings_open: false,
             settings_writer: None,
             settings_error,
@@ -1511,6 +1524,7 @@ impl Workspace {
             })
             .detach();
         }
+        workspace.watch_updates(cx);
         workspace.watch_omarchy_theme(cx);
         workspace.watch_boomux_overview(cx);
         workspace
@@ -1529,8 +1543,109 @@ impl Workspace {
                 pane_layout_mode: self.pane_layout_mode,
                 confirm_destructive_actions: self.confirm_destructive_actions,
                 settings_restart_pending: self.settings_restart_pending,
+                dismissed_desktop_update: self.dismissed_desktop_update.clone(),
+                dismissed_boomux_update: self.dismissed_boomux_update.clone(),
             });
         }
+    }
+
+    fn watch_updates(&mut self, cx: &mut Context<Self>) {
+        self.update_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_secs(10))
+                .await;
+            loop {
+                if this.update(cx, |this, cx| this.check_updates(cx)).is_err() {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_secs(6 * 60 * 60))
+                    .await;
+            }
+        }));
+    }
+
+    fn check_updates(&mut self, cx: &mut Context<Self>) {
+        if self.updates_checking {
+            return;
+        }
+        self.updates_checking = true;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async { updates::check() })
+                .await;
+            this.update(cx, |this, cx| {
+                this.updates_checking = false;
+                if this.updates_status.is_some() {
+                    this.updates_status = if result.unavailable {
+                        Some("Some update checks were unavailable. Try again later.".into())
+                    } else if result.desktop.is_none() && result.boomux.is_none() {
+                        Some("No newer releases found.".into())
+                    } else {
+                        None
+                    };
+                }
+                this.update_check = result;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn update_notices(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        let mut rows = Vec::new();
+        if let Some(status) = &self.updates_status {
+            rows.push(
+                div()
+                    .mb_3()
+                    .text_xs()
+                    .text_color(rgb(0xa6adc8))
+                    .child(status.clone())
+                    .into_any_element(),
+            );
+        }
+        for (index, notice, dismissed, name) in [
+            (
+                0usize,
+                &self.update_check.desktop,
+                &self.dismissed_desktop_update,
+                "Desktop",
+            ),
+            (
+                1,
+                &self.update_check.boomux,
+                &self.dismissed_boomux_update,
+                "Boomux",
+            ),
+        ] {
+            let Some(notice) = notice.as_ref().filter(|notice| notice.visible(dismissed)) else {
+                continue;
+            };
+            let version = notice.latest.clone();
+            let url = notice.url.clone();
+            rows.push(div().mb_3().p_3().rounded_md().border_1().border_color(rgb(0x45475a))
+                .flex().flex_col().gap_2()
+                .child(div().text_sm().text_color(rgb(0xcdd6f4)).child(format!("{name} update available")))
+                .child(div().text_xs().text_color(rgb(0xa6adc8)).child(format!("{} → {}", notice.current, notice.latest)))
+                .when(index == 1 && self.update_check.bundled, |card| card.child(
+                    div().text_xs().text_color(rgb(0xa6adc8)).child("This copy comes with Desktop. Update through a compatible Desktop release.")
+                ))
+                .child(div().flex().gap_2()
+                    .child(Self::settings_option(("view-update", index), "View release", true)
+                        .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url))))
+                    .child(Self::settings_option(("dismiss-update", index), "Dismiss", false)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if index == 0 { this.dismissed_desktop_update = version.clone(); }
+                            else { this.dismissed_boomux_update = version.clone(); }
+                            this.save_settings();
+                            cx.notify();
+                        }))))
+                .into_any_element());
+        }
+        rows
     }
 
     fn watch_omarchy_theme(&mut self, cx: &mut Context<Self>) {
@@ -4809,6 +4924,30 @@ impl Workspace {
                 )
                 .child(
                     div()
+                        .id("header-menu-updates")
+                        .h(px(36.0))
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|row| row.bg(rgb(0x313244)))
+                        .child(if self.updates_checking {
+                            "Checking for updates…"
+                        } else {
+                            "Check for updates"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.sidebar_header_menu_open = false;
+                            this.updates_status = Some("Checking for updates…".into());
+                            this.dismissed_desktop_update.clear();
+                            this.dismissed_boomux_update.clear();
+                            this.save_settings();
+                            this.check_updates(cx);
+                        })),
+                )
+                .child(
+                    div()
                         .id("header-menu-help")
                         .h(px(36.0))
                         .px_3()
@@ -5301,6 +5440,7 @@ impl Workspace {
                     .min_h_0()
                     .overflow_y_scroll()
                     .p_3()
+                    .children(self.update_notices(cx))
                     .child(
                         div()
                             .mb_2()
